@@ -54,13 +54,13 @@ foobar2000 ~/Music/*.mp3
 
 ---
 
-### 🍷 dwproton-run.sh
+### 🍷 dwproton-run
 
 Convenience wrapper for running Windows applications with a specific Proton version via Lutris.
 
 **Usage:**
 ```bash
-dwproton-run.sh program.exe
+dwproton-run program.exe
 ```
 
 **Requirements:**
@@ -68,7 +68,7 @@ dwproton-run.sh program.exe
 
 ---
 
-### ⌨️ run-wooting.sh
+### ⌨️ run-wooting
 
 Wrapper script to run Wooting Background Service in a distrobox container.
 
@@ -78,7 +78,7 @@ Wrapper script to run Wooting Background Service in a distrobox container.
 
 **Usage:**
 ```bash
-run-wooting.sh
+run-wooting
 ```
 
 **Requirements:**
