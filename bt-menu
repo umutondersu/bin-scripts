@@ -1,0 +1,411 @@
+#!/bin/bash
+# bt-menu — Interactive Bluetooth manager with fzf
+
+set -uo pipefail
+
+# Cleanup function
+cleanup() {
+    if [[ -n "${SCAN_PID:-}" ]] && kill -0 "$SCAN_PID" 2>/dev/null; then
+        kill "$SCAN_PID" 2>/dev/null || true
+    fi
+    bluetoothctl scan off >/dev/null 2>&1 || true
+}
+
+trap cleanup EXIT INT TERM
+
+# Check dependencies
+check_deps() {
+    local missing=()
+    local cmd
+    for cmd in "$@"; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo "Error: Missing required dependencies: ${missing[*]}" >&2
+        echo "Install with: sudo apt install bluez fzf gawk" >&2
+        exit 1
+    fi
+}
+
+# Show help message
+show_help() {
+    cat << 'EOF'
+bt-menu - Interactive Bluetooth manager
+
+USAGE:
+    bt-menu [COMMAND] [OPTIONS]
+
+COMMANDS:
+    help        Show this help message (default if no command)
+    pair        Scan for and pair with NEW Bluetooth devices
+    manage      Interactively manage paired devices (connect/disconnect/forget)
+    ls          List devices (with optional flags)
+
+OPTIONS:
+    pair [SECONDS]      Optional scan duration in seconds (default: 5)
+    ls -a, --all        Show all paired devices (including disconnected)
+
+EXAMPLES:
+    bt-menu              # Show help
+    bt-menu pair         # Scan for 5 seconds and pair with a new device
+    bt-menu pair 10      # Scan for 10 seconds and pair
+    bt-menu manage       # Manage already-paired devices (loops)
+    bt-menu ls           # Quick list of connected devices only
+    bt-menu ls --all     # List all paired devices with status
+
+REQUIREMENTS:
+    - bluetoothctl (bluez package)
+    - fzf (fuzzy finder) - for pair/manage commands
+    - awk (text processing)
+EOF
+}
+
+# Check if Bluetooth is powered on
+check_bluetooth() {
+    if ! bluetoothctl show | grep -q "Powered: yes"; then
+        echo "Bluetooth is powered off. Attempting to power on..." >&2
+        bluetoothctl power on >/dev/null 2>&1 || {
+            echo "Error: Failed to power on Bluetooth. Try: bluetoothctl power on" >&2
+            exit 1
+        }
+        sleep 1
+    fi
+}
+
+# Function to scan for new devices briefly
+scan_devices() {
+    local wait_time="${1:-5}"
+    echo "🔍 Scanning for devices (${wait_time}s)..."
+    bluetoothctl scan on >/dev/null 2>&1 &
+    SCAN_PID=$!
+    sleep "$wait_time"
+    if kill -0 "$SCAN_PID" 2>/dev/null; then
+        kill "$SCAN_PID" 2>/dev/null || true
+    fi
+    bluetoothctl scan off >/dev/null 2>&1
+    unset SCAN_PID
+}
+
+# Get list of paired devices
+get_paired() {
+    bluetoothctl paired-devices 2>/dev/null | \
+        awk '{mac=$2; $1=$2=""; name=substr($0,3); if(name) print mac " [PAIRED] " name}'
+}
+
+# Get list of unpaired devices (exclude already paired)
+get_new() {
+    local paired_macs
+    paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+    
+    bluetoothctl devices 2>/dev/null | \
+        awk -v paired="$paired_macs" '
+        BEGIN { split(paired, p_arr, "\n"); for(i in p_arr) paired_map[p_arr[i]]=1 }
+        {
+            mac=$2
+            $1=$2=""
+            name=substr($0,3)
+            if(name && !(mac in paired_map)) print mac " " name
+        }'
+}
+
+# Execute Bluetooth action with error handling
+execute_action() {
+    local action="$1"
+    local mac="$2"
+    local output
+    local status
+    
+    case "$action" in
+        connect)
+            echo "⏳ Connecting..."
+            output=$(bluetoothctl connect "$mac" 2>&1)
+            status=$?
+            ;;
+        pair)
+            echo "⏳ Pairing..."
+            output=$(bluetoothctl pair "$mac" 2>&1)
+            status=$?
+            ;;
+        trust)
+            echo "⏳ Trusting..."
+            output=$(bluetoothctl trust "$mac" 2>&1)
+            status=$?
+            ;;
+        disconnect)
+            echo "⏳ Disconnecting..."
+            output=$(bluetoothctl disconnect "$mac" 2>&1)
+            status=$?
+            ;;
+        remove)
+            echo "⏳ Removing..."
+            output=$(bluetoothctl remove "$mac" 2>&1)
+            status=$?
+            ;;
+    esac
+    
+    if [[ $status -eq 0 ]]; then
+        echo "✓ ${action^} successful"
+        return 0
+    else
+        echo "✗ ${action^} failed: $output" >&2
+        return 1
+    fi
+}
+
+# List connected devices
+cmd_list() {
+    check_deps bluetoothctl awk
+    
+    local show_all=false
+    
+    # Check for -a or --all flag
+    if [[ "${1:-}" == "-a" || "${1:-}" == "--all" ]]; then
+        show_all=true
+    fi
+    
+    if [[ "$show_all" == "true" ]]; then
+        echo "All Paired Bluetooth Devices:"
+    else
+        echo "Connected Bluetooth Devices:"
+    fi
+    echo "----------------------------"
+    echo ""
+    
+    local found_any=false
+    local paired_macs
+    
+    # Get all paired device MACs
+    paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+    
+    # Check each paired device for connection status
+    while IFS= read -r mac; do
+        [[ -z "$mac" ]] && continue
+        
+        local info
+        info=$(bluetoothctl info "$mac" 2>/dev/null)
+        
+        local is_connected
+        is_connected=$(echo "$info" | grep -q "Connected: yes" && echo "yes" || echo "no")
+        
+        # Skip disconnected devices unless --all flag is set
+        if [[ "$is_connected" == "no" && "$show_all" == "false" ]]; then
+            continue
+        fi
+        
+        found_any=true
+        
+        # Extract device details
+        local name battery icon status_icon
+        name=$(echo "$info" | grep "Name:" | head -1 | awk '{$1=""; print substr($0,2)}')
+        battery=$(echo "$info" | grep "Battery Percentage" | awk -F'[()]' '{print $2}')
+        icon=$(echo "$info" | grep "Icon:" | awk '{print $2}')
+        
+        # Status indicator
+        if [[ "$is_connected" == "yes" ]]; then
+            status_icon="🟢"
+        else
+            status_icon="⚪"
+        fi
+        
+        echo -n "  $status_icon $name"
+        [[ -n "$battery" ]] && echo -n " (🔋 $battery%)"
+        echo ""
+        echo "     MAC: $mac"
+        [[ -n "$icon" ]] && echo "     Type: $icon"
+        if [[ "$show_all" == "true" ]]; then
+            if [[ "$is_connected" == "yes" ]]; then
+                echo "     Status: Connected"
+            else
+                echo "     Status: Disconnected"
+            fi
+        fi
+        echo ""
+    done <<< "$paired_macs"
+    
+    if [[ "$found_any" == "false" ]]; then
+        if [[ "$show_all" == "true" ]]; then
+            echo "No paired devices found."
+        else
+            echo "No devices currently connected."
+            echo "Use 'bt-menu ls --all' to see all paired devices."
+        fi
+    fi
+}
+
+# Interactive device manager (all paired devices)
+cmd_manage() {
+    check_deps bluetoothctl fzf awk
+    check_bluetooth
+    
+    while true; do
+        # Get all paired devices with connection status
+        local menu=""
+        local paired_macs
+        paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+        
+        if [[ -z "$paired_macs" ]]; then
+            echo "No paired devices found." >&2
+            echo "Use 'bt-menu pair' to pair with new devices." >&2
+            exit 0
+        fi
+        
+        # Build menu with connection status
+        while IFS= read -r mac; do
+            [[ -z "$mac" ]] && continue
+            
+            local info
+            info=$(bluetoothctl info "$mac" 2>/dev/null)
+            
+            local name status_tag
+            name=$(echo "$info" | grep "Name:" | head -1 | awk '{$1=""; print substr($0,2)}')
+            
+            if echo "$info" | grep -q "Connected: yes"; then
+                status_tag="[CONNECTED]"
+            else
+                status_tag="[DISCONNECTED]"
+            fi
+            
+            menu+="$mac $status_tag $name"$'\n'
+        done <<< "$paired_macs"
+        
+        # Device selection
+        local choice
+        choice=$(echo "$menu" | grep -v '^$' | fzf --prompt="📱 Select device to manage (ESC to quit): " \
+                                     --header="Paired Devices" \
+                                     --border --height=50%) || exit 0
+        
+        local mac name is_connected
+        mac=$(echo "$choice" | awk '{print $1}')
+        is_connected=$(echo "$choice" | grep -q "\[CONNECTED\]" && echo "yes" || echo "no")
+        name=$(echo "$choice" | awk '{$1=$2=""; print substr($0,2)}')
+        
+        # Conditional action menu based on connection status
+        local actions
+        if [[ "$is_connected" == "yes" ]]; then
+            actions="Disconnect\nForget (Remove)"
+        else
+            actions="Connect\nForget (Remove)"
+        fi
+        
+        local action
+        action=$(echo -e "$actions" | fzf --prompt="⚡ Action for '$name': " \
+                                          --header="Choose action" \
+                                          --border --height=40%) || continue
+        
+        echo ""
+        case "$action" in
+            "Connect")
+                execute_action connect "$mac" || sleep 2
+                ;;
+            "Disconnect")
+                execute_action disconnect "$mac" || sleep 2
+                ;;
+            "Forget (Remove)")
+                echo "⚠️  This will remove the device. Continue? (y/N)"
+                read -r -n 1 confirm
+                echo ""
+                if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    execute_action remove "$mac" || sleep 2
+                else
+                    echo "Cancelled."
+                fi
+                ;;
+        esac
+        
+        echo ""
+        echo "Press Enter to continue..."
+        read -r
+    done
+}
+
+# Main pairing function (only for unpaired devices)
+cmd_pair() {
+    check_deps bluetoothctl fzf awk
+    check_bluetooth
+    
+    local wait_time=5
+    
+    # Parse optional wait time flag
+    if [[ -n "${1:-}" ]]; then
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+            wait_time="$1"
+        else
+            echo "Error: Invalid wait time '$1'. Must be a positive integer." >&2
+            exit 1
+        fi
+    fi
+    
+    scan_devices "$wait_time"
+    
+    # Build menu: only show NEW/unpaired devices
+    local menu
+    menu=$(get_new | sort -u)
+    
+    if [[ -z "$menu" ]]; then
+        echo "No unpaired devices found." >&2
+        echo "" >&2
+        echo "Tips:" >&2
+        echo "  • Put your Bluetooth device in pairing/discovery mode" >&2
+        echo "  • Make sure the device is charged and nearby" >&2
+        echo "  • Use 'bt-menu manage' to work with already-paired devices" >&2
+        exit 1
+    fi
+    
+    # Device selection
+    local choice
+    choice=$(echo "$menu" | fzf --prompt="🔍 Select NEW device to pair (ESC to quit): " \
+                                 --header="New/Unpaired Devices" \
+                                 --border --height=50%) || exit 0
+    
+    local mac name
+    mac=$(echo "$choice" | awk '{print $1}')
+    name=$(echo "$choice" | awk '{$1=""; print substr($0,2)}')
+    
+    # Pair directly without action menu
+    echo ""
+    echo "Pairing with '$name'..."
+    if execute_action pair "$mac"; then
+        execute_action trust "$mac"
+        sleep 1
+        execute_action connect "$mac"
+        echo ""
+        echo "✓ Successfully paired and connected to '$name'"
+    else
+        echo ""
+        echo "✗ Failed to pair with '$name'"
+        exit 1
+    fi
+}
+
+# Main entry point
+main() {
+    local command="${1:-}"
+    
+    case "$command" in
+        "")
+            show_help
+            ;;
+        help|--help|-h)
+            show_help
+            ;;
+        pair)
+            cmd_pair "${2:-}"
+            ;;
+        ls|list)
+            cmd_list "${2:-}"
+            ;;
+        manage|m)
+            cmd_manage
+            ;;
+        *)
+            echo "Error: Unknown command '$command'" >&2
+            echo "Run 'bt-menu help' for usage information" >&2
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
