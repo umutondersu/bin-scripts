@@ -1,2 +1,2 @@
-# Exclude endfields-run.sh
-endfields-run.sh
+# Ignore all shell scripts with .sh extension
+*.sh
