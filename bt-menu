@@ -89,26 +89,76 @@ scan_devices() {
     unset SCAN_PID
 }
 
-# Get list of paired devices
-get_paired() {
-    bluetoothctl paired-devices 2>/dev/null | \
-        awk '{mac=$2; $1=$2=""; name=substr($0,3); if(name) print mac " [PAIRED] " name}'
+# Get list of all Bluetooth controllers
+get_controllers() {
+    bluetoothctl list 2>/dev/null | awk '{print $2}'
 }
 
-# Get list of unpaired devices (exclude already paired)
-get_new() {
-    local paired_macs
-    paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+# Get list of paired devices from all controllers
+get_paired() {
+    local controllers
+    controllers=$(get_controllers)
     
-    bluetoothctl devices 2>/dev/null | \
-        awk -v paired="$paired_macs" '
-        BEGIN { split(paired, p_arr, "\n"); for(i in p_arr) paired_map[p_arr[i]]=1 }
-        {
-            mac=$2
-            $1=$2=""
-            name=substr($0,3)
-            if(name && !(mac in paired_map)) print mac " " name
-        }'
+    local all_devices=""
+    local controller
+    
+    # Query each controller
+    while IFS= read -r controller; do
+        [[ -z "$controller" ]] && continue
+        bluetoothctl select "$controller" >/dev/null 2>&1
+        local devices
+        devices=$(bluetoothctl paired-devices 2>/dev/null | \
+            awk '{mac=$2; $1=$2=""; name=substr($0,3); if(name) print mac " [PAIRED] " name}')
+        if [[ -n "$devices" ]]; then
+            all_devices+="$devices"$'\n'
+        fi
+    done <<< "$controllers"
+    
+    # Remove duplicates and print
+    echo "$all_devices" | grep -v '^$' | sort -u
+}
+
+# Get list of unpaired devices (exclude already paired) from all controllers
+get_new() {
+    local controllers
+    controllers=$(get_controllers)
+    
+    # Get all paired MACs from all controllers
+    local paired_macs=""
+    local controller
+    while IFS= read -r controller; do
+        [[ -z "$controller" ]] && continue
+        bluetoothctl select "$controller" >/dev/null 2>&1
+        local macs
+        macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+        if [[ -n "$macs" ]]; then
+            paired_macs+="$macs"$'\n'
+        fi
+    done <<< "$controllers"
+    
+    # Get all devices from all controllers and filter out paired ones
+    local all_new=""
+    while IFS= read -r controller; do
+        [[ -z "$controller" ]] && continue
+        bluetoothctl select "$controller" >/dev/null 2>&1
+        
+        local devices
+        devices=$(bluetoothctl devices 2>/dev/null | \
+            awk -v paired="$paired_macs" '
+            BEGIN { split(paired, p_arr, "\n"); for(i in p_arr) paired_map[p_arr[i]]=1 }
+            {
+                mac=$2
+                $1=$2=""
+                name=substr($0,3)
+                if(name && !(mac in paired_map)) print mac " " name
+            }')
+        if [[ -n "$devices" ]]; then
+            all_new+="$devices"$'\n'
+        fi
+    done <<< "$controllers"
+    
+    # Remove duplicates and print
+    echo "$all_new" | grep -v '^$' | sort -u
 }
 
 # Execute Bluetooth action with error handling
@@ -175,17 +225,45 @@ cmd_list() {
     echo ""
     
     local found_any=false
-    local paired_macs
+    local controllers
+    controllers=$(get_controllers)
     
-    # Get all paired device MACs
-    paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+    # Query all controllers for paired devices
+    local all_paired_macs=""
+    local controller
+    while IFS= read -r controller; do
+        [[ -z "$controller" ]] && continue
+        bluetoothctl select "$controller" >/dev/null 2>&1
+        local macs
+        macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+        if [[ -n "$macs" ]]; then
+            all_paired_macs+="$macs"$'\n'
+        fi
+    done <<< "$controllers"
     
-    # Check each paired device for connection status
+    # Process each unique paired device
+    local processed_macs=""
     while IFS= read -r mac; do
         [[ -z "$mac" ]] && continue
         
-        local info
-        info=$(bluetoothctl info "$mac" 2>/dev/null)
+        # Skip if already processed (avoid duplicates)
+        if echo "$processed_macs" | grep -q "^${mac}$"; then
+            continue
+        fi
+        processed_macs+="$mac"$'\n'
+        
+        # Try to get info from any controller
+        local info=""
+        while IFS= read -r controller; do
+            [[ -z "$controller" ]] && continue
+            bluetoothctl select "$controller" >/dev/null 2>&1
+            info=$(bluetoothctl info "$mac" 2>/dev/null)
+            if [[ -n "$info" ]] && echo "$info" | grep -q "Name:"; then
+                break
+            fi
+        done <<< "$controllers"
+        
+        [[ -z "$info" ]] && continue
         
         local is_connected
         is_connected=$(echo "$info" | grep -q "Connected: yes" && echo "yes" || echo "no")
@@ -223,7 +301,7 @@ cmd_list() {
             fi
         fi
         echo ""
-    done <<< "$paired_macs"
+    done <<< "$all_paired_macs"
     
     if [[ "$found_any" == "false" ]]; then
         if [[ "$show_all" == "true" ]]; then
@@ -241,23 +319,52 @@ cmd_manage() {
     check_bluetooth
     
     while true; do
-        # Get all paired devices with connection status
+        # Get all paired devices from all controllers
         local menu=""
-        local paired_macs
-        paired_macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+        local controllers
+        controllers=$(get_controllers)
         
-        if [[ -z "$paired_macs" ]]; then
+        local all_paired_macs=""
+        local controller
+        while IFS= read -r controller; do
+            [[ -z "$controller" ]] && continue
+            bluetoothctl select "$controller" >/dev/null 2>&1
+            local macs
+            macs=$(bluetoothctl paired-devices 2>/dev/null | awk '{print $2}')
+            if [[ -n "$macs" ]]; then
+                all_paired_macs+="$macs"$'\n'
+            fi
+        done <<< "$controllers"
+        
+        if [[ -z "$all_paired_macs" ]]; then
             echo "No paired devices found." >&2
             echo "Use 'bt-menu pair' to pair with new devices." >&2
             exit 0
         fi
         
         # Build menu with connection status
+        local processed_macs=""
         while IFS= read -r mac; do
             [[ -z "$mac" ]] && continue
             
-            local info
-            info=$(bluetoothctl info "$mac" 2>/dev/null)
+            # Skip if already processed (avoid duplicates)
+            if echo "$processed_macs" | grep -q "^${mac}$"; then
+                continue
+            fi
+            processed_macs+="$mac"$'\n'
+            
+            # Try to get info from any controller
+            local info=""
+            while IFS= read -r controller; do
+                [[ -z "$controller" ]] && continue
+                bluetoothctl select "$controller" >/dev/null 2>&1
+                info=$(bluetoothctl info "$mac" 2>/dev/null)
+                if [[ -n "$info" ]] && echo "$info" | grep -q "Name:"; then
+                    break
+                fi
+            done <<< "$controllers"
+            
+            [[ -z "$info" ]] && continue
             
             local name status_tag
             name=$(echo "$info" | grep "Name:" | head -1 | awk '{$1=""; print substr($0,2)}')
@@ -269,7 +376,7 @@ cmd_manage() {
             fi
             
             menu+="$mac $status_tag $name"$'\n'
-        done <<< "$paired_macs"
+        done <<< "$all_paired_macs"
         
         # Device selection
         local choice
