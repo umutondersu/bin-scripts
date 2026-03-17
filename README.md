@@ -88,6 +88,29 @@ run-wooting
 
 ---
 
+### 📱 scrcpy-autostart
+
+Automatically launches scrcpy when an Android phone is plugged in via USB.
+
+**Features:**
+- Launched by udev via `systemd-run --user`
+- Waits up to 30 seconds for ADB authorisation before proceeding
+- Launches scrcpy with screen-off and stay-awake flags
+
+**Usage:**
+
+Triggered automatically by udev when a device is connected. Can also be run manually:
+```bash
+scrcpy-autostart
+```
+
+**Requirements:**
+- `adb` (Android Debug Bridge)
+- `scrcpy`
+- udev rule to trigger on device plug-in
+
+---
+
 ## Installation
 
 1. Clone this repository:
