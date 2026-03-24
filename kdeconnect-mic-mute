@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+kdeconnect-mic-mute: Automatically mute/unmute microphone on KDE Connect phone calls.
+
+Primary mechanism — sink mute mirroring:
+  KDE Connect's PauseMusic plugin already mutes the default output sink when a call
+  starts and unmutes it when it ends. We run `pactl subscribe` in a background thread,
+  watch for sink change events, and mirror the sink's mute state to the default input
+  source (microphone). This covers both "ringing" and "talking" call states and is
+  independent of KDE Connect's D-Bus signal design.
+
+Secondary mechanism — D-Bus signals (supplementary):
+  - callReceived: only fires for "ringing" and "missedCall". The KDE Connect telephony
+    plugin returns early for "talking" events without emitting this signal, so it cannot
+    be relied on as the sole trigger. Used here as a supplementary early-mute path for
+    incoming calls.
+  - notificationRemoved: belt-and-suspenders call-end detector. If the KDE Connect call
+    notification is dismissed while in_call is set, we unmute the mic.
+
+Cleanup:
+  SIGTERM/SIGINT handlers ensure the mic is unmuted and the pactl subprocess is
+  terminated cleanly on exit.
+"""
+
+import subprocess
+import logging
+import signal as posix_signal
+import threading
+
+import dbus
+import dbus.mainloop.glib
+from gi.repository import GLib
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [kdeconnect-mic-mute] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+DEVICE_ID = "8454f739b5aa4b56a6449b789844b095"
+TELEPHONY_IFACE = "org.kde.kdeconnect.device.telephony"
+NOTIFICATIONS_IFACE = "org.kde.kdeconnect.device.notifications"
+TELEPHONY_PATH = f"/modules/kdeconnect/devices/{DEVICE_ID}/telephony"
+NOTIFICATIONS_PATH = f"/modules/kdeconnect/devices/{DEVICE_ID}/notifications"
+
+
+def get_sink_mute(sink_name: str) -> bool | None:
+    """Return True if the sink is muted, False if unmuted, None on error."""
+    result = subprocess.run(
+        ["pactl", "get-sink-mute", sink_name],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return "yes" in result.stdout
+
+
+def set_mic_mute(mute: bool):
+    state = "1" if mute else "0"
+    action = "Muting" if mute else "Unmuting"
+    log.info(f"{action} microphone")
+    result = subprocess.run(
+        ["pactl", "set-source-mute", "@DEFAULT_SOURCE@", state],
+        capture_output=True,
+    )
+    if result.returncode != 0:
+        log.error(f"pactl failed: {result.stderr.decode().strip()}")
+
+
+class CallMuteHandler:
+    def __init__(self):
+        self.in_call = False
+
+    def on_sink_mute_changed(self, muted: bool):
+        """
+        Called when the default sink's mute state changes. Mirrors the state to the
+        mic: muted sink means a call is active, unmuted sink means it ended.
+        in_call guards against redundant pactl calls if events fire more than once.
+        """
+        if muted and not self.in_call:
+            log.info("Sink muted (call started) — muting mic")
+            self.in_call = True
+            set_mic_mute(True)
+        elif not muted and self.in_call:
+            log.info("Sink unmuted (call ended) — unmuting mic")
+            self.in_call = False
+            set_mic_mute(False)
+
+    def on_call_received(self, event, phone_number, contact_name):
+        """
+        Supplementary: handles the callReceived D-Bus signal from the KDE Connect
+        telephony plugin. Only fires for "ringing" and "missedCall" — the plugin
+        returns early for "talking" without emitting this signal. Useful as an
+        early-mute path for incoming calls before PauseMusic mutes the sink.
+        """
+        event = str(event)
+        log.info(f"callReceived signal: '{event}' from {contact_name or phone_number or 'unknown'}")
+        if event in ("ringing",) and not self.in_call:
+            log.info("Ringing — muting mic (pre-emptive)")
+            self.in_call = True
+            set_mic_mute(True)
+        elif event == "missedCall" and self.in_call:
+            log.info("Missed call — unmuting mic")
+            self.in_call = False
+            set_mic_mute(False)
+
+    def on_notification_removed(self, notification_id):
+        """
+        Belt-and-suspenders: if a KDE Connect notification is removed while we think
+        we're in a call, treat it as a call-end signal and unmute the mic.
+        """
+        if self.in_call:
+            log.info("Call notification removed — call ended, unmuting mic")
+            self.in_call = False
+            set_mic_mute(False)
+
+    def cleanup(self):
+        if self.in_call:
+            set_mic_mute(False)
+
+
+def watch_sink_mute(handler: CallMuteHandler, loop: GLib.MainLoop):
+    """
+    Spawn `pactl subscribe` as a subprocess and read its output in a background
+    thread. On every sink change event, query the current mute state of the default
+    sink and schedule on_sink_mute_changed on the GLib main loop via idle_add so
+    it runs on the main thread (required for D-Bus safety).
+    """
+    default_sink = subprocess.run(
+        ["pactl", "get-default-sink"], capture_output=True, text=True
+    ).stdout.strip()
+    log.info(f"Watching sink: {default_sink}")
+
+    proc = subprocess.Popen(
+        ["pactl", "subscribe"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+    )
+
+    def read_events():
+        for line in proc.stdout:
+            line = line.strip()
+            # We only care about sink change events
+            if "change' on sink" not in line:
+                continue
+            muted = get_sink_mute(default_sink)
+            if muted is None:
+                continue
+            # Schedule on the GLib main loop (thread-safe)
+            GLib.idle_add(handler.on_sink_mute_changed, muted)
+
+    thread = threading.Thread(target=read_events, daemon=True)
+    thread.start()
+    return proc
+
+
+def main():
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SessionBus()
+
+    handler = CallMuteHandler()
+    loop = GLib.MainLoop()
+
+    # Primary: watch sink mute via pactl subscribe
+    pactl_proc = watch_sink_mute(handler, loop)
+
+    # Secondary: callReceived D-Bus signal (handles ringing before sink is muted)
+    bus.add_signal_receiver(
+        handler.on_call_received,
+        signal_name="callReceived",
+        dbus_interface=TELEPHONY_IFACE,
+        path=TELEPHONY_PATH,
+    )
+
+    # Secondary: notification removal for call-end detection
+    bus.add_signal_receiver(
+        handler.on_notification_removed,
+        signal_name="notificationRemoved",
+        dbus_interface=NOTIFICATIONS_IFACE,
+        path=NOTIFICATIONS_PATH,
+    )
+
+    log.info(f"Watching sink mute + callReceived signals for device {DEVICE_ID}")
+
+    def handle_signal(signum, frame):
+        log.info("Shutting down — cleaning up")
+        handler.cleanup()
+        pactl_proc.terminate()
+        loop.quit()
+
+    posix_signal.signal(posix_signal.SIGTERM, handle_signal)
+    posix_signal.signal(posix_signal.SIGINT, handle_signal)
+
+    log.info("kdeconnect-mic-mute started, waiting for events...")
+    loop.run()
+
+
+if __name__ == "__main__":
+    main()

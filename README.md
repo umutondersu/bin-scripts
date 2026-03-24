@@ -88,6 +88,30 @@ run-wooting
 
 ---
 
+### 📞 kdeconnect-mic-mute
+
+Automatically mutes the microphone when a phone call is active via KDE Connect, and unmutes when the call ends.
+
+**How it works:**
+
+KDE Connect's PauseMusic plugin already mutes the default output sink during calls. This script watches for sink mute state changes via `pactl subscribe` and mirrors them to the default input source (microphone). The KDE Connect telephony D-Bus signals are also monitored as a supplementary path for incoming call detection.
+
+**Usage:**
+
+Runs as a systemd user service — no manual interaction needed.
+
+```bash
+systemctl --user status kdeconnect-mic-mute   # Check status
+journalctl --user -fu kdeconnect-mic-mute     # Watch live logs
+```
+
+**Requirements:**
+- KDE Connect with PauseMusic plugin enabled and configured to mute system sound
+- `pactl` (PipeWire or PulseAudio)
+- `python-dbus`
+
+---
+
 ### 📱 scrcpy-autostart
 
 Automatically launches scrcpy when an Android phone is plugged in via USB.
