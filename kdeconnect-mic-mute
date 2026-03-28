@@ -71,13 +71,27 @@ def set_mic_mute(mute: bool):
 class CallMuteHandler:
     def __init__(self):
         self.in_call = False
+        # Ignore the first sink change event fired shortly after startup —
+        # it can reflect a pre-existing muted state rather than a new call.
+        self.ready = False
+        GLib.timeout_add_seconds(3, self._set_ready)
+
+    def _set_ready(self):
+        self.ready = True
+        log.info("Ready — now tracking sink mute changes")
+        return False  # don't repeat
 
     def on_sink_mute_changed(self, muted: bool):
         """
         Called when the default sink's mute state changes. Mirrors the state to the
         mic: muted sink means a call is active, unmuted sink means it ended.
         in_call guards against redundant pactl calls if events fire more than once.
+        Ignored for the first few seconds after startup to avoid false positives
+        from pre-existing sink mute state.
         """
+        if not self.ready:
+            log.debug("Ignoring sink change event during startup grace period")
+            return
         if muted and not self.in_call:
             log.info("Sink muted (call started) — muting mic")
             self.in_call = True
@@ -123,19 +137,22 @@ class CallMuteHandler:
 def watch_sink_mute(handler: CallMuteHandler, loop: GLib.MainLoop):
     """
     Spawn `pactl subscribe` as a subprocess and read its output in a background
-    thread. On every sink change event, query the current mute state of the default
-    sink and schedule on_sink_mute_changed on the GLib main loop via idle_add so
-    it runs on the main thread (required for D-Bus safety).
+    thread. On every sink change event, query the current mute state of
+    @DEFAULT_SINK@ — resolved fresh each time so it follows whichever sink
+    PipeWire currently considers default (e.g. easyeffects_sink when EasyEffects
+    is running). Schedules on_sink_mute_changed on the GLib main loop via
+    idle_add so it runs on the main thread (required for D-Bus safety).
     """
-    default_sink = subprocess.run(
-        ["pactl", "get-default-sink"], capture_output=True, text=True
-    ).stdout.strip()
-    log.info(f"Watching sink: {default_sink}")
-
     proc = subprocess.Popen(
         ["pactl", "subscribe"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
     )
+
+    # Log the current default sink for reference, but don't lock it in
+    default_sink = subprocess.run(
+        ["pactl", "get-default-sink"], capture_output=True, text=True
+    ).stdout.strip()
+    log.info(f"Current default sink at startup: {default_sink} (re-checked on each event)")
 
     def read_events():
         for line in proc.stdout:
@@ -143,7 +160,9 @@ def watch_sink_mute(handler: CallMuteHandler, loop: GLib.MainLoop):
             # We only care about sink change events
             if "change' on sink" not in line:
                 continue
-            muted = get_sink_mute(default_sink)
+            # Always query @DEFAULT_SINK@ so we follow the current default,
+            # not whatever was default when the script started
+            muted = get_sink_mute("@DEFAULT_SINK@")
             if muted is None:
                 continue
             # Schedule on the GLib main loop (thread-safe)
