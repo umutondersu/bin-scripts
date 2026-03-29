@@ -3,7 +3,7 @@
 # Written by Drew Weymouth
 
 # Location of foobar2000 installation
-FOOBAR_HOME="/home/qorcialwolf/foobar2000"
+FOOBAR_HOME="$HOME/foobar2000"
 
 # Go through args, convert paths to existing files to Windows-style
 i=0 args=()
@@ -17,4 +17,4 @@ for arg in "$@"; do
 done
 
 # Call foobar; ignore error messages printed by Wine
-WINEPREFIX="/home/qorcialwolf/.local/share/wineprefixes/foobar" wine "$FOOBAR_HOME/foobar2000.exe" "${args[@]}" 2>/dev/null &
+WINEPREFIX="$HOME/.local/share/wineprefixes/foobar" wine "$FOOBAR_HOME/foobar2000.exe" "${args[@]}" 2>/dev/null &
