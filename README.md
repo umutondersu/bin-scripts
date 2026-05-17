@@ -97,6 +97,18 @@ run-wooting
 - Wooting Background Service AppImage
 - Ubuntu 24.04 container named `wooting-container`
 
+### sekirofpsunlock
+
+A binary executable to patch Sekiro: Shadows Die Twice for Linux.
+
+Original project [Repository](https://github.com/Lahvuun/sekirofpsunlock)
+
+Launch Option Example:
+
+```
+sekirofpsunlock 15 set-resolution 2560 2560 1440 set-fps 180 & %command%
+```
+
 ---
 
 ## Installation
