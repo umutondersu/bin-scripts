@@ -1,0 +1,95 @@
+#!/bin/bash
+
+URL="$1"
+APP_NAME="$2"
+
+# 1. Ensure user provided a URL
+if [ -z "$URL" ]; then
+    echo "Usage: ./mkapp.sh <URL> [\"App Name\"]"
+    echo "Example: ./mkapp.sh https://music.youtube.com \"YouTube Music\""
+    exit 1
+fi
+
+# If no name given, fetch it from the page <title>
+if [ -z "$APP_NAME" ]; then
+    echo "No app name provided, fetching page title from $URL..."
+    APP_NAME=$(curl -fsSL -A "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36" "$URL" | grep -oP '(?<=<title>)[^<]+' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    if [ -z "$APP_NAME" ]; then
+        echo "Error: Could not fetch page title. Please provide a name manually."
+        exit 1
+    fi
+    echo "Using title: $APP_NAME"
+fi
+
+# 2. Find Helium (or fallback to Chrome/Chromium)
+binary=$(which helium-browser 2>/dev/null || which google-chrome-stable 2>/dev/null || which chromium 2>/dev/null)
+
+if [ -z "$binary" ]; then
+    echo "Error: Supported Chromium-based browser not found."
+    exit 1
+fi
+
+# 3. Format names and paths
+# Converts "YouTube Music" to "youtube-music"
+SAFE_NAME=$(echo "$APP_NAME" | tr ' ' '-' | tr '[:upper:]' '[:lower:]')
+# Extracts domain (e.g., music.youtube.com) for the icon fetcher
+DOMAIN=$(echo "$URL" | awk -F/ '{print $3}')
+# Chromium derives the Wayland app ID from the domain, replacing dots with underscores
+# e.g. music.youtube.com -> chrome-music.youtube.com__-Default
+WAYLAND_APP_ID="chrome-${DOMAIN}__-Default"
+
+DESKTOP_DIR="$HOME/.local/share/applications"
+ICON_DIR="$HOME/.local/share/icons/webapps"
+# Primary file named after the Wayland app ID so KDE can find it by desktopFile
+FILE_PATH="$DESKTOP_DIR/${WAYLAND_APP_ID}.desktop"
+ICON_PATH="$ICON_DIR/${SAFE_NAME}.png"
+
+# 4. Check for duplicate
+if [ -f "$FILE_PATH" ]; then
+    existing_url=$(grep -oP '(?<=--app=")[^"]+' "$FILE_PATH" 2>/dev/null)
+    echo "Error: A webapp for '$DOMAIN' already exists at $FILE_PATH"
+    [ -n "$existing_url" ] && echo "  Existing URL: $existing_url"
+    echo "  Remove it first if you want to recreate it."
+    exit 1
+fi
+
+# 5. Create necessary directories
+mkdir -p "$DESKTOP_DIR"
+mkdir -p "$ICON_DIR"
+
+# 6. Download a high-res (128x128) favicon for the app
+# -L follows redirects, -f fails on HTTP errors instead of saving error pages
+echo "Fetching icon for $DOMAIN..."
+if ! curl -fsSL "https://www.google.com/s2/favicons?domain=$DOMAIN&sz=128" -o "$ICON_PATH"; then
+    echo "Warning: Failed to download icon. You may need to set it manually."
+fi
+
+# Verify we actually got an image (not an HTML error page)
+if ! file "$ICON_PATH" 2>/dev/null | grep -qiE 'image|png|jpeg|gif|webp'; then
+    echo "Warning: Downloaded file does not appear to be a valid image."
+    echo "  Got: $(file "$ICON_PATH" 2>/dev/null)"
+    echo "  You may need to replace $ICON_PATH manually."
+fi
+
+# 7. Generate the .desktop file
+# Note: --class is omitted because Chromium ignores it on native Wayland.
+# The Wayland app ID is always derived from the URL by the browser.
+# We name the file after the Wayland app ID so KDE matches it correctly.
+cat <<EOF > "$FILE_PATH"
+[Desktop Entry]
+Version=1.0
+Name=$APP_NAME
+Exec=$binary --app="$URL" --new-window
+Terminal=false
+Type=Application
+Categories=Network;WebBrowser;
+Icon=$ICON_PATH
+StartupWMClass=$WAYLAND_APP_ID
+EOF
+
+# 8. Refresh the application launcher database
+update-desktop-database "$DESKTOP_DIR" &>/dev/null
+
+echo "Success! '$APP_NAME' has been installed."
+echo "Icon saved to: $ICON_PATH"
+echo "Desktop file saved to: $FILE_PATH"

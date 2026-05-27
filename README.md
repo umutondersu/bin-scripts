@@ -97,6 +97,33 @@ run-wooting
 - Wooting Background Service AppImage
 - Ubuntu 24.04 container named `wooting-container`
 
+### 🌐 mkwebapp
+
+Creates a KDE/Wayland-compatible `.desktop` file for a web app using a Chromium-based browser.
+
+**Features:**
+
+- Automatically fetches the page title if no name is given
+- Downloads a 128x128 favicon as the app icon
+- Names the `.desktop` file after the Chromium Wayland app ID so KDE matches the taskbar icon correctly
+- Detects duplicates and exits early to avoid overwriting existing entries
+
+**Usage:**
+
+```bash
+mkwebapp <URL> [App Name]
+mkwebapp https://music.youtube.com "YouTube Music"
+mkwebapp https://music.youtube.com   # fetches title automatically
+```
+
+**Requirements:**
+
+- `helium-browser`, `google-chrome-stable`, or `chromium`
+- `curl`
+- `file`
+
+---
+
 ### sekirofpsunlock
 
 A binary executable to patch Sekiro: Shadows Die Twice for Linux.
