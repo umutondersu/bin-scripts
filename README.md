@@ -60,6 +60,54 @@ foobar2000 ~/Music/*.mp3
 
 ---
 
+### 🎶 echo-nano-sync.py
+
+Sync foobar2000 playlists to a FiiO SnowSky ECHO NANO SD card.
+
+The ECHO NANO ignores `.m3u` files entirely — its SoC can't read them. This script works around that by copying tracks into per-playlist folders with embedded tags (`ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`) so the device's album/artist browser shows them as playlists.
+
+**Features:**
+
+- Converts foobar2000 `.fplite` playlists → clean UTF-8 `.m3u` files
+- Incrementally syncs to the card: only copies new tracks, removes dropped ones, renames/reorders changed positions
+- Enforces the device's 8,192-track firmware limit across all playlists
+- Zero-padded filenames (`0001`, `0002`, …) so the player sorts by playlist order, not alphabetically
+- `--repad` command to fix padding on existing cards without re-copying
+- `--reset --yes` to wipe the card workspace and do a clean rebuild
+- `--dry-run` to preview changes without writing anything
+
+**Defaults** (edit constants at top of script if paths change):
+
+| Setting | Default |
+|---|---|
+| foobar2000 profile | `~/foobar2000/profile` |
+| Source library | `~/Music/0Main` |
+| Playlist `.m3u` dir | `~/Music/0Main/Playlists` |
+| SD card mount | `/run/media/qorcialwolf/NANO SD` |
+
+**Usage:**
+
+```bash
+echo-nano-sync.py --list                              # list all foobar playlists + track counts
+echo-nano-sync.py                                     # convert + sync "Top Rated" (default)
+echo-nano-sync.py --playlists "Top Rated,Favorites"  # multiple playlists
+echo-nano-sync.py --playlists all                    # every playlist except whole-library dupes
+echo-nano-sync.py --sync-only                        # skip conversion, just sync to card
+echo-nano-sync.py --convert-only                     # just regenerate .m3u files
+echo-nano-sync.py --reset --yes                      # wipe card workspace and rebuild (~2h for 1721 tracks)
+echo-nano-sync.py --repad                            # fix filename padding on existing card (seconds)
+echo-nano-sync.py --dry-run                          # preview without writing
+```
+
+**Requirements:**
+
+- Python venv at `~/src/echo-nano/.venv` with `mutagen` installed
+- EchoList library at `~/src/echo-nano/echolist`
+- foobar2000 (Wine) with playlists saved as `.fplite` format
+- SD card mounted at `/run/media/qorcialwolf/NANO SD`
+
+---
+
 ### 🍷 dwproton-run
 
 Convenience wrapper for running Windows applications with a specific Proton version via Lutris.
