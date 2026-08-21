@@ -1,20 +1,17 @@
 #!/home/qorcialwolf/src/echo-nano/.venv/bin/python3
 """Echo NANO sync pipeline.
 
-Stage 1 — CONVERT: regenerate UTF-8 .m3u playlists in ~/Music/0Main/Playlists
-   from foobar2000's authoritative .fplite data (never touching audio files).
-
-Stage 2 — SYNC: deploy selected playlists to the SD card via the EchoList
-   library (folder-per-playlist copies + playlist tags), enforcing the
-   8,192-track firmware limit.
+Reads foobar2000 .fplite playlists directly — no intermediate .m3u files
+needed for syncing. Deploys selected playlists to the SD card via the
+EchoList library (folder-per-playlist copies + playlist tags), enforcing
+the 8,192-track firmware limit.
 
 Usage examples:
-  echo-nano-sync.py --list
-  echo-nano-sync.py --playlists "Top Rated,R Top Rated"            # convert + sync
-  echo-nano-sync.py --playlists "Top Rated" --sync-only            # card only
-  echo-nano-sync.py --playlists "Top Rated" --convert-only         # m3u only
-  echo-nano-sync.py --playlists "Top Rated" --reset --yes          # wipe card workspace, full rebuild
-  echo-nano-sync.py --playlists "Top Rated" --desired-set "..."    # (future) 
+  echo-nano-sync --list
+  echo-nano-sync --playlists "Top Rated,R Top Rated"   # sync from foobar directly
+  echo-nano-sync --playlists "Top Rated" --convert-only # write .m3u files only
+  echo-nano-sync --playlists "Top Rated" --reset --yes  # wipe card workspace, full rebuild
+  echo-nano-sync --repad                                # fix filename padding on card
 
 Sync is incremental: it adds new tracks, removes stale ones, and reorders
 copies to match the foobar playlist order — only copying the delta.
@@ -33,7 +30,7 @@ MAX_TRACKS = 8192
 DEFAULT_PROFILE = HOME / "foobar2000" / "profile"
 DEFAULT_SOURCE_ROOT = HOME / "Music" / "0Main"
 DEFAULT_PLAYLIST_DIR = DEFAULT_SOURCE_ROOT / "Playlists"
-DEFAULT_DEST = Path("/run/media/qorcialwolf/NANO SD")
+DEFAULT_DEST = Path("/run/media/qorcialwolf/disk")
 DEFAULT_ECHOLIST_SRC = HOME / "src" / "echo-nano" / "echolist"
 
 # Internal playlists that are just the whole library under another name.
@@ -79,9 +76,33 @@ def get_fplite_path(profile: Path, guid: str) -> Path:
 
 
 def parse_fplite(fplite: Path, source_root: Path) -> tuple[list[Path], list[str]]:
-    """Read one .fplite -> (tracks in playlist order, unresolved entries)."""
+    """Read one .fplite -> (tracks in playlist order, unresolved entries).
+
+    Handles two path styles foobar writes:
+      file-relative://../Music/0Main/Artist/Album/track.flac  (current)
+      ../OneDrive/Music/0Main/ZSingles/track.flac             (old layout)
+
+    Old-layout paths had an extra tier (ZSingles/, Albums/, ZZExtra/) that
+    was later flattened directly into 0Main/. We strip that tier as a fallback,
+    then fall back to a filename-only search for files that moved elsewhere.
+    """
     tracks: list[Path] = []
     missing: list[str] = []
+    OLD_PREFIXES = {"ZSingles", "Albums", "ZZExtra"}
+
+    # Build filename index lazily for the fallback step
+    _file_index: dict[str, list[Path]] | None = None
+
+    def file_index() -> dict[str, list[Path]]:
+        nonlocal _file_index
+        if _file_index is None:
+            _file_index = {}
+            exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".ape"}
+            for p in source_root.rglob("*"):
+                if p.suffix.lower() in exts:
+                    _file_index.setdefault(p.name.lower(), []).append(p)
+        return _file_index
+
     for raw in fplite.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
         if not line:
@@ -91,11 +112,29 @@ def parse_fplite(fplite: Path, source_root: Path) -> tuple[list[Path], list[str]
         marker = "0Main/"
         if marker in entry:
             entry = entry.split(marker, 1)[1]
+
+        # 1. direct match
         p = source_root / entry
         if p.is_file():
             tracks.append(p.resolve())
-        else:
-            missing.append(line)
+            continue
+
+        # 2. strip old layout prefix (ZSingles/, Albums/, ZZExtra/)
+        parts = entry.split("/")
+        if parts[0] in OLD_PREFIXES:
+            p2 = source_root / "/".join(parts[1:])
+            if p2.is_file():
+                tracks.append(p2.resolve())
+                continue
+
+        # 3. filename-only fallback (handles files that moved to a new subfolder)
+        fname = Path(entry).name.lower()
+        matches = file_index().get(fname, [])
+        if len(matches) == 1:
+            tracks.append(matches[0].resolve())
+            continue
+
+        missing.append(line)
     return tracks, missing
 
 
@@ -107,42 +146,33 @@ def write_m3u(name: str, tracks: list[Path], dest_dir: Path) -> Path:
     return out
 
 
-def convert_playlists(profile: Path, source_root: Path, dest_dir: Path,
-                      selected: list[str], dry_run: bool = False) -> list[dict]:
+def load_fplite_wants(profile: Path, source_root: Path,
+                      selected: list[str]) -> tuple[dict[str, list[Path]], int]:
+    """Parse fplites for all selected playlists directly.
+
+    Returns (wants, exit_code) where wants maps name -> ordered track paths
+    and exit_code is 1 if any playlist had unresolved entries."""
     index = load_playlist_index(profile)
-    reports = []
-    for sel in selected:
-        canonical = resolve_fplite_name(sel, index)
+    wants: dict[str, list[Path]] = {}
+    exit_code = 0
+    for name in selected:
+        canonical = resolve_fplite_name(name, index)
         guid = next((g for g, n in index.items() if n == canonical), None)
         if guid is None:
-            reports.append({"name": sel, "error": f"no foobar playlist named '{sel}'"})
+            print(f"- '{name}': ERROR no foobar playlist named '{name}'")
+            exit_code = 1
             continue
         fplite = get_fplite_path(profile, guid)
         if not fplite.exists():
-            reports.append({"name": canonical, "error": f"missing {fplite.name}"})
+            print(f"- '{canonical}': ERROR missing {fplite.name}")
+            exit_code = 1
             continue
         tracks, missing = parse_fplite(fplite, source_root)
-        out = None
-        if not dry_run:
-            out = write_m3u(canonical, tracks, dest_dir)
-        reports.append({
-            "name": canonical,
-            "guid": guid,
-            "fplite": fplite.name,
-            "tracks": len(tracks),
-            "missing": missing,
-            "out": str(out) if out else str(dest_dir / f"{canonical}.m3u"),
-        })
-    return reports
-
-
-def load_selected_m3u(name: str, playlist_dir: Path, source_root: Path) -> list[Path]:
-    """Return resolved, ordered track paths from a generated .m3u file."""
-    from echolist.m3u import parse_m3u
-    result = parse_m3u(playlist_dir / f"{name}.m3u", source_root=source_root)
-    if result["missing"]:
-        print(f"    WARNING {len(result['missing'])} m3u entries did not resolve")
-    return result["tracks"]
+        if missing:
+            print(f"- '{canonical}': WARNING {len(missing)} unresolved entries")
+            exit_code = 1
+        wants[canonical] = tracks
+    return wants, exit_code
 
 
 def open_manager(dest_root: Path, source_root: Path) -> "object":
@@ -302,8 +332,8 @@ def repad_card(dest_root: Path, source_root: Path) -> int:
         mgr.release_lock()
 
 
-def plan_sync(dest_root: Path, source_root: Path, playlist_dir: Path,
-              selected: list[str], dry_run: bool, reset: bool) -> int:
+def plan_sync(dest_root: Path, source_root: Path,
+              wants: dict[str, list[Path]], dry_run: bool, reset: bool) -> int:
     from echolist.manager import PlaylistManager
 
     if reset and not dry_run:
@@ -327,14 +357,13 @@ def plan_sync(dest_root: Path, source_root: Path, playlist_dir: Path,
 
         exit_code = 0
         synced = reconciled = up_to_date = skipped = 0
-        for name in selected:
+        for name, want in wants.items():
             pid = playlist_id(name)
             if dry_run:
                 state = (len(existing_by_pid.get(pid, set())),
                          "exists" if pid in existing_by_pid else "new")
                 print(f"- '{name}': {state} on card")
                 continue
-            want = load_selected_m3u(name, playlist_dir, source_root)
             budget = MAX_TRACKS - grand_total
             res = sync_playlist(mgr, pid, name, want, budget)
             if res["status"] == "synced":
@@ -414,17 +443,18 @@ def main() -> int:
 
     exit_code = 0
 
-    if not args.sync_only:
+    # Parse all selected playlists directly from foobar .fplite files
+    wants, parse_exit = load_fplite_wants(profile, source_root, selected)
+    exit_code = parse_exit
+
+    if not args.sync_only and wants:
         print("== convert: fplite -> .m3u ==")
-        for r in convert_playlists(profile, source_root, playlist_dir, selected, args.dry_run):
-            if "error" in r:
-                print(f"- '{r['name']}': ERROR {r['error']}")
-                exit_code = 1
-                continue
-            status = "OK" if not r["missing"] else f"WARNING {len(r['missing'])} unresolved"
-            print(f"- '{r['name']}': {r['tracks']} tracks -> {r['out']}  [{status}]")
-            if r["missing"]:
-                exit_code = 1
+        for name, tracks in wants.items():
+            if not args.dry_run:
+                out = write_m3u(name, tracks, playlist_dir)
+                print(f"- '{name}': {len(tracks)} tracks -> {out}  [OK]")
+            else:
+                print(f"- '{name}': {len(tracks)} tracks -> {playlist_dir / (name + '.m3u')}  [dry-run]")
 
     if not args.convert_only:
         if not dest_root.exists():
@@ -434,8 +464,8 @@ def main() -> int:
             print("--reset requires --yes (it wipes dest/Playlists on the card)")
             return 2
         print(f"\n== sync: -> {dest_root} ==")
-        exit_code = exit_code or plan_sync(dest_root, source_root, playlist_dir,
-                                           selected, args.dry_run, args.reset)
+        exit_code = exit_code or plan_sync(dest_root, source_root,
+                                           wants, args.dry_run, args.reset)
 
     return exit_code
 
