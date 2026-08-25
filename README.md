@@ -28,9 +28,9 @@ bt-menu ls --all     # List all paired devices with status
 
 **Requirements:**
 
-- `bluetoothctl` (bluez package)
-- `fzf` (fuzzy finder)
-- `awk` (text processing)
+* `bluetoothctl` (bluez package)
+* `fzf` (fuzzy finder)
+* `awk` (text processing)
 
 ---
 
@@ -40,9 +40,9 @@ Command-line interface to a Wine installation of foobar2000.
 
 **Features:**
 
-- Automatically converts Linux paths to Windows-style paths
-- Launches foobar2000 in the background
-- Passes command-line arguments to foobar2000
+* Automatically converts Linux paths to Windows-style paths
+* Launches foobar2000 in the background
+* Passes command-line arguments to foobar2000
 
 **Usage:**
 
@@ -53,8 +53,8 @@ foobar2000 ~/Music/*.mp3
 
 **Requirements:**
 
-- Wine
-- foobar2000 installed in Wine prefix
+* Wine
+* foobar2000 installed in Wine prefix
 
 **Credits:** Written by Drew Weymouth
 
@@ -62,49 +62,47 @@ foobar2000 ~/Music/*.mp3
 
 ### 🎶 echo-nano-sync
 
-Sync foobar2000 playlists to a FiiO SnowSky ECHO NANO SD card.
+Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP SD card using a nested-directory layout.
 
-The ECHO NANO ignores `.m3u` files entirely — its SoC can't read them. This script works around that by copying tracks into per-playlist folders with embedded tags (`ALBUM`, `ALBUMARTIST`, `TRACKNUMBER`) so the device's album/artist browser shows them as playlists.
+The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. This script organizes files into a nested directory structure so you get 1-click access to curated favorites while keeping full library playback in chronological order—without duplicating files or mangling audio metadata.
 
-**Features:**
+**Architecture & How it Works:**
 
-- Reads foobar2000 `.fplite` playlists directly — no intermediate files needed
-- Incrementally syncs to the card: only copies new tracks, removes dropped ones, renames/reorders changed positions
-- Enforces the device's 8,192-track firmware limit across all playlists
-- Zero-padded filenames (`0001`, `0002`, …) so the player sorts by playlist order, not alphabetically
-- `--repad` command to fix padding on existing cards without re-copying
-- `--reset --yes` to wipe the card workspace and do a clean rebuild
-- `--convert-only` to export playlists as `.m3u` files without touching the card
-- `--dry-run` to preview changes without writing anything
+* **Zero Metadata Mangling:** Leaves all audio tags (`TITLE`, `ARTIST`, `ALBUM`, `GENRE`) completely untouched.
+* **Embedded Cover Art Stripping:** Automatically removes high-resolution embedded images (`APIC`, `covr`, FLAC pictures) to optimize storage on FAT32/exFAT.
+* **Top Rated (`Storage > TF Card > Music > Top Rated`):** 4★+ songs live in `/Music/Top Rated/` for direct, single-click folder browsing.
+* **All Songs (`Category > All Songs`):** Recursively indexes `/Music/` and `/Music/Top Rated/`, playing the entire collection sorted by zero-padded filename rank (`0001.`, `0002.`, …) in exact foobar2000 reverse-date order.
+* **Zero Duplicate Files:** Keeps all tracks as single physical files, comfortably staying within the 8,192-track limit.
+* **Incremental & Resumable:** Tracks state on-card in `.manifest_nested.json` after every write. Safe to interrupt with `Ctrl+C` and resume anytime.
+* **Safety Checks:** Pre-flight free storage validation, auto-cleanup of OS junk files (`.DS_Store`, `._*`), write-cache flushing (`os.sync()`), and optional auto-eject.
 
-**Defaults** (edit constants at top of script if paths change):
+**Defaults** (auto-detected or overridden via CLI):
 
-| Setting | Default |
-|---|---|
-| foobar2000 profile | `~/foobar2000/profile` |
-| Source library | `~/Music/0Main` |
-| SD card mount | `/run/media/qorcialwolf/NANO SD` |
+| Setting | Default | Description |
+| --- | --- | --- |
+| foobar2000 profile | `~/foobar2000/profile` | Location of playlist index and `.fplite` files |
+| Source library | `~/Music/0Main` | Root directory of your local music library |
+| Master playlist | `Library Sorted` | Full library ordered chronologically |
+| Top-rated playlist | `Top Rated` | Curated favorites playlist |
+| SD card mount | `/run/media/$USER/*` | Auto-detects mounted removable storage |
 
 **Usage:**
 
 ```bash
-echo-nano-sync --list                              # list all foobar playlists + track counts
-echo-nano-sync                                     # convert + sync "Top Rated" (default)
-echo-nano-sync --playlists "Top Rated,Favorites"  # multiple playlists
-echo-nano-sync --playlists all                    # every playlist except whole-library dupes
-echo-nano-sync --sync-only                        # sync to card only (no .m3u export)
-echo-nano-sync --convert-only                     # export .m3u files only, don't touch card
-echo-nano-sync --reset --yes                      # wipe card workspace and rebuild (~2h for 1721 tracks)
-echo-nano-sync --repad                            # fix filename padding on existing card (seconds)
-echo-nano-sync --dry-run                          # preview without writing
+echo-nano-sync                         # Incremental sync of library to auto-detected SD card
+echo-nano-sync --eject-after           # Sync and safely unmount the card with udisksctl on completion
+echo-nano-sync --dry-run               # Preview plan (copies, moves, art strips) without writing
+echo-nano-sync --limit 20              # Sync only the first 20 tracks (useful for fast verification)
+echo-nano-sync --force-strip           # Force re-check and strip embedded art from all files on card
+echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
 ```
 
 **Requirements:**
 
-- Python venv at `~/src/echo-nano/.venv` with `mutagen` installed
-- EchoList library at `~/src/echo-nano/echolist`
-- foobar2000 (Wine) with playlists saved as `.fplite` format
-- SD card mounted at `/run/media/qorcialwolf/NANO SD`
+* Python 3.9+ with `mutagen`
+* foobar2000 (Wine) with playlists saved in `.fplite` format
+* `udisksctl` (optional, for `--eject-after`)
+* `libnotify` / `notify-send` (optional, for desktop notifications)
 
 ---
 
@@ -120,7 +118,7 @@ dwproton-run program.exe
 
 **Requirements:**
 
-- Lutris with Proton runner installed
+* Lutris with Proton runner installed
 
 ---
 
@@ -130,8 +128,8 @@ Wrapper script to run Wooting Background Service in a distrobox container.
 
 **Features:**
 
-- Solves GLIBC compatibility issues on older distros
-- Runs the service in an Ubuntu 24.04 container
+* Solves GLIBC compatibility issues on older distros
+* Runs the service in an Ubuntu 24.04 container
 
 **Usage:**
 
@@ -141,9 +139,11 @@ run-wooting
 
 **Requirements:**
 
-- `distrobox`
-- Wooting Background Service AppImage
-- Ubuntu 24.04 container named `wooting-container`
+* `distrobox`
+* Wooting Background Service AppImage
+* Ubuntu 24.04 container named `wooting-container`
+
+---
 
 ### 🌐 mkwebapp
 
@@ -151,10 +151,10 @@ Creates a KDE/Wayland-compatible `.desktop` file for a web app using a Chromium-
 
 **Features:**
 
-- Automatically fetches the page title if no name is given
-- Downloads a 128x128 favicon as the app icon
-- Names the `.desktop` file after the Chromium Wayland app ID so KDE matches the taskbar icon correctly
-- Detects duplicates and exits early to avoid overwriting existing entries
+* Automatically fetches the page title if no name is given
+* Downloads a 128x128 favicon as the app icon
+* Names the `.desktop` file after the Chromium Wayland app ID so KDE matches the taskbar icon correctly
+* Detects duplicates and exits early to avoid overwriting existing entries
 
 **Usage:**
 
@@ -166,13 +166,13 @@ mkwebapp https://music.youtube.com   # fetches title automatically
 
 **Requirements:**
 
-- `helium-browser`, `google-chrome-stable`, or `chromium`
-- `curl`
-- `file`
+* `helium-browser`, `google-chrome-stable`, or `chromium`
+* `curl`
+* `file`
 
 ---
 
-### sekirofpsunlock
+### ⚔️ sekirofpsunlock
 
 A binary executable to patch Sekiro: Shadows Die Twice for Linux.
 
@@ -180,7 +180,7 @@ Original project [Repository](https://github.com/Lahvuun/sekirofpsunlock)
 
 Launch Option Example:
 
-```
+```text
 sekirofpsunlock 15 set-resolution 2560 2560 1440 set-fps 180 & %command%
 ```
 
@@ -191,7 +191,7 @@ sekirofpsunlock 15 set-resolution 2560 2560 1440 set-fps 180 & %command%
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/bin-scripts.git ~/bin
+git clone https://github.com/umutondersu/bin-scripts.git ~/bin
 ```
 
 2. Ensure `~/bin` is in your PATH:
@@ -214,3 +214,6 @@ These are personal scripts, but feel free to fork and adapt them for your own us
 ## License
 
 MIT License - Feel free to use and modify as needed.
+
+```
+
