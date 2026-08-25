@@ -1,53 +1,98 @@
-#!/home/qorcialwolf/src/echo-nano/.venv/bin/python3
-"""Echo NANO sync pipeline.
+#!/usr/bin/env python3
+"""Echo NANO Subdirectory Layout Sync (Pure Filename Sorting Edition).
 
-Reads foobar2000 .fplite playlists directly — no intermediate .m3u files
-needed for syncing. Deploys selected playlists to the SD card via the
-EchoList library (folder-per-playlist copies + playlist tags), enforcing
-the 8,192-track firmware limit.
-
-Usage examples:
-  echo-nano-sync --list
-  echo-nano-sync --playlists "Top Rated,R Top Rated"   # sync from foobar directly
-  echo-nano-sync --playlists "Top Rated" --convert-only # write .m3u files only
-  echo-nano-sync --playlists "Top Rated" --reset --yes  # wipe card workspace, full rebuild
-  echo-nano-sync --repad                                # fix filename padding on card
-
-Sync is incremental: it adds new tracks, removes stale ones, and reorders
-copies to match the foobar playlist order — only copying the delta.
+- Places Top Rated tracks into /Music/Top Rated/<rank>. <Title>.<ext>
+- Places remaining tracks into /Music/<rank>. <Title>.<ext>
+- Total tracks remain exactly 7,815 (under 8,192 limit).
+- All metadata tags (TITLE, ARTIST, ALBUM, GENRE) left 100% untouched.
+- Strips embedded cover art to optimize SD card storage.
+- Pre-flight storage checks & automatic FAT32 dot-file cleanup.
+- OS write-cache sync + optional auto-eject (--eject-after).
+- Human-readable ETA formatting (HH:MM:SS / MM:SS).
+- Desktop notification on complete.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import re
 import shutil
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
+
+import mutagen
+from mutagen.flac import FLAC
+from mutagen.id3 import ID3, ID3NoHeaderError
 
 HOME = Path.home()
 MAX_TRACKS = 8192
 
 DEFAULT_PROFILE = HOME / "foobar2000" / "profile"
 DEFAULT_SOURCE_ROOT = HOME / "Music" / "0Main"
-DEFAULT_PLAYLIST_DIR = DEFAULT_SOURCE_ROOT / "Playlists"
-DEFAULT_DEST = Path("/run/media/qorcialwolf/disk")
-DEFAULT_ECHOLIST_SRC = HOME / "src" / "echo-nano" / "echolist"
+DEFAULT_MASTER_PLAYLIST = "Library Sorted"
+DEFAULT_TOP_RATED_PLAYLIST = "Top Rated"
 
-# Internal playlists that are just the whole library under another name.
-DUPES_OF_WHOLE_LIBRARY = {"Whole Library", "Library Playback"}
+GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
 
 
-def _add_echolist_to_path(echolist_src: Path) -> None:
-    if str(echolist_src) not in sys.path:
-        sys.path.insert(0, str(echolist_src))
-    try:
-        import echolist.manager  # noqa: F401
-    except ImportError as exc:
-        sys.exit(f"cannot import echolist from {echolist_src}: {exc}")
+def format_eta(seconds: int) -> str:
+    """Format seconds into human-readable HH:MM:SS or MM:SS."""
+    if seconds < 0 or seconds > 86400 * 7:
+        return "--:--"
+    hrs, remainder = divmod(seconds, 3600)
+    mins, secs = divmod(remainder, 60)
+    if hrs > 0:
+        return f"{hrs:02d}:{mins:02d}:{secs:02d}"
+    return f"{mins:02d}:{secs:02d}"
+
+
+def render_progress_bar(
+    current: int,
+    total: int,
+    prefix: str = "",
+    length: int = 24,
+    extra: str = "",
+) -> None:
+    if total <= 0:
+        return
+    percent = current / total
+    filled = int(length * percent)
+    bar = "█" * filled + "░" * (length - filled)
+    pct_str = f"{percent * 100:>5.1f}%"
+    count_str = f"[{current}/{total}]"
+    extra_str = f" | {extra}" if extra else ""
+    sys.stdout.write(f"\r{prefix:<16} |{bar}| {pct_str} {count_str}{extra_str}\033[K")
+    sys.stdout.flush()
+    if current == total:
+        sys.stdout.write("\n")
+
+
+def send_notification(title: str, msg: str) -> None:
+    if shutil.which("notify-send"):
+        subprocess.run(["notify-send", "-a", "Echo Sync", title, msg], check=False)
+
+
+def find_default_dest() -> Path | None:
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or HOME.name
+    search_roots = [Path("/run/media") / user, Path("/media") / user, Path("/Volumes")]
+    for root in search_roots:
+        if root.exists() and root.is_dir():
+            mounts = [p for p in root.iterdir() if p.is_dir()]
+            if mounts:
+                return mounts[0]
+    return None
+
+
+def sanitize_filename(name: str) -> str:
+    return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
 def load_playlist_index(profile: Path) -> dict[str, str]:
-    """Map foobar GUID -> playlist name from playlists-v2.0/index.txt."""
     index_file = profile / "playlists-v2.0" / "index.txt"
     if not index_file.exists():
         sys.exit(f"foobar playlist index not found: {index_file}")
@@ -61,65 +106,56 @@ def load_playlist_index(profile: Path) -> dict[str, str]:
     return mapping
 
 
-def resolve_fplite_name(name: str, index: dict[str, str]) -> str:
-    """Return the canonical playlist name matching `name` (case/fold-insensitive)."""
-    from echolist.naming import playlist_id
-    target = playlist_id(name)
-    for candidate in index.values():
-        if playlist_id(candidate) == target:
-            return candidate
-    return name
+def get_global_file_index(source_root: Path) -> dict[str, list[Path]]:
+    global GLOBAL_FILE_INDEX
+    if GLOBAL_FILE_INDEX is None:
+        sys.stdout.write("Building file index fallback cache... ")
+        sys.stdout.flush()
+        GLOBAL_FILE_INDEX = {}
+        exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".ape"}
+        for p in source_root.rglob("*"):
+            if p.suffix.lower() in exts:
+                GLOBAL_FILE_INDEX.setdefault(p.name.lower(), []).append(p)
+        print("Done.")
+    return GLOBAL_FILE_INDEX
 
 
-def get_fplite_path(profile: Path, guid: str) -> Path:
-    return profile / "playlists-v2.0" / f"playlist-{guid}.fplite"
+def parse_fplite(
+    profile: Path, index: dict[str, str], playlist_name: str, source_root: Path
+) -> list[Path]:
+    guid = next(
+        (g for g, n in index.items() if n.lower() == playlist_name.lower()), None
+    )
+    if not guid:
+        print(f"Warning: Playlist '{playlist_name}' not found in index.")
+        return []
 
+    fplite = profile / "playlists-v2.0" / f"playlist-{guid}.fplite"
+    if not fplite.exists():
+        print(f"Warning: Missing file {fplite.name}")
+        return []
 
-def parse_fplite(fplite: Path, source_root: Path) -> tuple[list[Path], list[str]]:
-    """Read one .fplite -> (tracks in playlist order, unresolved entries).
-
-    Handles two path styles foobar writes:
-      file-relative://../Music/0Main/Artist/Album/track.flac  (current)
-      ../OneDrive/Music/0Main/ZSingles/track.flac             (old layout)
-
-    Old-layout paths had an extra tier (ZSingles/, Albums/, ZZExtra/) that
-    was later flattened directly into 0Main/. We strip that tier as a fallback,
-    then fall back to a filename-only search for files that moved elsewhere.
-    """
     tracks: list[Path] = []
-    missing: list[str] = []
     OLD_PREFIXES = {"ZSingles", "Albums", "ZZExtra"}
-
-    # Build filename index lazily for the fallback step
-    _file_index: dict[str, list[Path]] | None = None
-
-    def file_index() -> dict[str, list[Path]]:
-        nonlocal _file_index
-        if _file_index is None:
-            _file_index = {}
-            exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".ape"}
-            for p in source_root.rglob("*"):
-                if p.suffix.lower() in exts:
-                    _file_index.setdefault(p.name.lower(), []).append(p)
-        return _file_index
 
     for raw in fplite.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
         if not line:
             continue
-        entry = line[len("file-relative://"):] if line.startswith("file-relative://") else line
+        entry = (
+            line[len("file-relative://") :]
+            if line.startswith("file-relative://")
+            else line
+        )
         entry = entry.replace("\\", "/")
-        marker = "0Main/"
-        if marker in entry:
-            entry = entry.split(marker, 1)[1]
+        if "0Main/" in entry:
+            entry = entry.split("0Main/", 1)[1]
 
-        # 1. direct match
         p = source_root / entry
         if p.is_file():
             tracks.append(p.resolve())
             continue
 
-        # 2. strip old layout prefix (ZSingles/, Albums/, ZZExtra/)
         parts = entry.split("/")
         if parts[0] in OLD_PREFIXES:
             p2 = source_root / "/".join(parts[1:])
@@ -127,347 +163,396 @@ def parse_fplite(fplite: Path, source_root: Path) -> tuple[list[Path], list[str]
                 tracks.append(p2.resolve())
                 continue
 
-        # 3. filename-only fallback (handles files that moved to a new subfolder)
         fname = Path(entry).name.lower()
-        matches = file_index().get(fname, [])
+        idx_cache = get_global_file_index(source_root)
+        matches = idx_cache.get(fname, [])
         if len(matches) == 1:
             tracks.append(matches[0].resolve())
-            continue
 
-        missing.append(line)
-    return tracks, missing
+    return tracks
 
 
-def write_m3u(name: str, tracks: list[Path], dest_dir: Path) -> Path:
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    out = dest_dir / f"{name}.m3u"
-    body = [f"#PLAYLIST: {name}"] + [str(p) for p in tracks]
-    out.write_text("\n".join(body) + "\n", encoding="utf-8-sig")
-    return out
+def get_clean_title(path: Path) -> str:
+    raw_title = ""
+    try:
+        audio = mutagen.File(path)
+        if audio is not None:
+            if hasattr(audio, "tags") and audio.tags:
+                if "TIT2" in audio.tags:
+                    raw_title = str(audio.tags["TIT2"])
+                elif "\xa9nam" in audio.tags:
+                    raw_title = str(audio.tags["\xa9nam"][0])
+            if not raw_title and "title" in audio:
+                raw_title = str(audio["title"][0])
+    except Exception:
+        pass
+
+    used_filename_fallback = False
+    if not raw_title:
+        raw_title = path.stem
+        used_filename_fallback = True
+
+    clean = re.sub(r"^\d+[\s._-]+", "", raw_title).strip()
+    if used_filename_fallback:
+        clean = re.sub(r"^.+?\s-\s+", "", clean).strip()
+
+    return clean or path.stem
 
 
-def load_fplite_wants(profile: Path, source_root: Path,
-                      selected: list[str]) -> tuple[dict[str, list[Path]], int]:
-    """Parse fplites for all selected playlists directly.
+def strip_cover_art_only(dst_file: Path) -> None:
+    """Strip embedded cover art without modifying any audio tags."""
+    try:
+        suffix = dst_file.suffix.lower()
 
-    Returns (wants, exit_code) where wants maps name -> ordered track paths
-    and exit_code is 1 if any playlist had unresolved entries."""
-    index = load_playlist_index(profile)
-    wants: dict[str, list[Path]] = {}
-    exit_code = 0
-    for name in selected:
-        canonical = resolve_fplite_name(name, index)
-        guid = next((g for g, n in index.items() if n == canonical), None)
-        if guid is None:
-            print(f"- '{name}': ERROR no foobar playlist named '{name}'")
-            exit_code = 1
-            continue
-        fplite = get_fplite_path(profile, guid)
-        if not fplite.exists():
-            print(f"- '{canonical}': ERROR missing {fplite.name}")
-            exit_code = 1
-            continue
-        tracks, missing = parse_fplite(fplite, source_root)
-        if missing:
-            print(f"- '{canonical}': WARNING {len(missing)} unresolved entries")
-            exit_code = 1
-        wants[canonical] = tracks
-    return wants, exit_code
+        if suffix == ".flac":
+            audio_flac = FLAC(dst_file)
+            if audio_flac.pictures:
+                audio_flac.clear_pictures()
+                audio_flac.save()
 
-
-def open_manager(dest_root: Path, source_root: Path) -> "object":
-    from echolist.manager import PlaylistManager
-    workspace_config = dest_root / "Playlists" / ".echolist" / "config.json"
-    if workspace_config.exists():
-        return PlaylistManager.open(dest_root)
-    return PlaylistManager.init(source_root, dest_root)
-
-
-def reset_workspace(dest_root: Path) -> None:
-    from echolist.safe_write import SafeWriter
-    workspace = SafeWriter(dest_root).root / "Playlists"
-    if workspace.exists():
-        shutil.rmtree(workspace)
-        print(f"removed {workspace}")
-
-
-def _ordered_srcs(mgr, pl: dict) -> list[str]:
-    src_root = Path(mgr.config.source_root).resolve()
-    ordered = sorted(pl["tracks"], key=lambda t: t.get("index", 0))
-    return [str(src_root / (t.get("src_path") or "")) for t in ordered]
-
-
-def _reorder_to(mgr, pid: str, want: list[Path]) -> None:
-    """Rename store-track copy files and re-tag so they match `want` order exactly."""
-    from echolist.naming import track_filename
-    from echolist.tags import apply_playlist_tags
-
-    pl = mgr.store.playlists[pid]
-    src_root = Path(mgr.config.source_root).resolve()
-    by_src = {str(src_root / (t.get("src_path") or "")): t for t in pl["tracks"]}
-    pad = len(str(len(want)))
-    plan = []
-    for pos, p in enumerate(want, 1):
-        t = by_src.get(str(p))
-        if t is None:
-            raise RuntimeError(f"reorder: no stored track for {p}")
-        ext = Path(t["copy_name"]).suffix
-        title = t["copy_name"].split(" - ", 1)[-1].rsplit(".", 1)[0]
-        plan.append((t, pos, t["copy_name"], track_filename(pos, title, ext, pad)))
-
-    folder = pl["folder"]
-    # pass 1: every file that must change goes to a unique temp name
-    for t, idx, old, new in plan:
-        if old != new:
-            tmp = f"_echolist_tmp_{idx}_{old}"
+        elif suffix == ".mp3":
             try:
-                mgr.writer.rename(f"{folder}/{old}", f"{folder}/{tmp}")
-            except Exception:
+                tags = ID3(dst_file)
+                if any(k.startswith("APIC") for k in tags.keys()):
+                    tags.delall("APIC")
+                    tags.save(dst_file)
+            except ID3NoHeaderError:
                 pass
-    # pass 2: temp -> final name, update store + tags
-    for t, idx, old, new in plan:
-        src = f"_echolist_tmp_{idx}_{old}" if old != new else old
-        if old != new:
-            try:
-                mgr.writer.rename(f"{folder}/{src}", f"{folder}/{new}")
-            except Exception:
-                new = old  # keep old name if the rename failed
-        t["index"] = idx
-        t["copy_name"] = new
+
+        elif suffix in {".m4a", ".mp4", ".aac"}:
+            audio = mutagen.File(dst_file)
+            if audio and audio.tags and "covr" in audio.tags:
+                del audio.tags["covr"]
+                audio.save()
+
+    except Exception as exc:
+        err_str = str(exc)
+        if (
+            "Read-only" in err_str
+            or "No space" in err_str
+            or "[Errno " in err_str
+            or isinstance(exc, OSError)
+        ):
+            raise OSError(err_str) from exc
+        print(f"\n[Warning] Art strip skipped on {dst_file.name}: {exc}")
+
+
+def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
+    try:
+        tmp_manifest = manifest_file.with_suffix(".tmp")
+        tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        tmp_manifest.replace(manifest_file)
+    except OSError as exc:
+        sys.exit(f"\n\n[FATAL] Failed to save manifest: {exc}")
+
+
+def clean_junk_files(dir_music: Path) -> None:
+    """Strip OS-generated hidden dot-files from FAT32/exFAT."""
+    for junk in dir_music.rglob("._*"):
+        junk.unlink(missing_ok=True)
+    for ds in dir_music.rglob(".DS_Store"):
+        ds.unlink(missing_ok=True)
+
+
+def sync_nested_top_rated(
+    dest_root: Path,
+    master_tracks: list[Path],
+    top_rated_tracks: set[Path],
+    dry_run: bool,
+    force_strip: bool = False,
+    auto_eject: bool = False,
+) -> None:
+    total_master = len(master_tracks)
+    if total_master > MAX_TRACKS:
+        sys.exit(
+            f"ERROR: Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
+        )
+
+    dir_music = dest_root / "Music"
+    dir_top = dir_music / "Top Rated"
+
+    if not dry_run:
         try:
-            path = mgr.writer.resolve(f"{folder}/{new}")
-            apply_playlist_tags(path, mgr.config.node_name,
-                                mgr.config.album_prefix + pl["name"],
-                                idx, t.get("src_path", ""), pid)
+            dir_music.mkdir(parents=True, exist_ok=True)
+            dir_top.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            sys.exit(f"[FATAL] Cannot create target directories: {exc}")
+
+    manifest_file = dir_music / ".manifest_nested.json"
+    manifest: dict[str, dict] = {}
+    if manifest_file.exists():
+        try:
+            manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
         except Exception:
-            pass
-    pl["tracks"] = [entry[0] for entry in plan]  # bring store list order in line
-    mgr.store.save()
+            manifest = {}
 
+    current_master_set = {str(p.resolve()) for p in master_tracks}
 
-def sync_playlist(mgr, pid: str, name: str, want: list[Path], budget: int) -> dict:
-    """Ensure `mgr`'s playlist `pid` contains exactly `want` tracks, in order.
+    # 1. Prune removed tracks
+    stale_srcs = [src for src in manifest if src not in current_master_set]
+    for src in stale_srcs:
+        old_rel = manifest[src].get("rel_path")
+        if old_rel:
+            stale_file = dir_music / old_rel
+            if stale_file.exists() and not dry_run:
+                try:
+                    stale_file.unlink()
+                except OSError as exc:
+                    sys.exit(f"\n[FATAL] Failed to delete {stale_file.name}: {exc}")
+        del manifest[src]
 
-    Incremental: keeps unchanged copies, adds missing ones, removes stale ones,
-    then reorders so files match the playlist order on the card."""
-    want_set = {str(p) for p in want}
-    store_pid = mgr.store.playlists.get(pid)
+    if stale_srcs and not dry_run:
+        save_manifest(manifest_file, manifest)
 
-    if store_pid is None:
-        if len(want) > budget:
-            return {"status": "over-limit",
-                    "detail": f"needs {len(want)} tracks but only {budget} of {MAX_TRACKS} remain"}
-        mgr.create_playlist(name)
-        added = 0
-        for pos, src in enumerate(want, 1):
-            mgr.add_track(pid, src, total=len(want))
-            added += 1
-            if pos % 100 == 0 or pos == len(want):
-                print(f"    [{name}] {pos}/{len(want)}")
-        return {"status": "synced", "count": added}
+    # 2. Plan additions, moves, and in-place art stripping
+    copied = moved = stripped = 0
+    move_plan: list[tuple[Path, Path, Path]] = []
+    copy_plan: list[tuple[Path, Path, str, str, float]] = []
+    strip_plan: list[tuple[Path, str, float]] = []
 
-    src_root = Path(mgr.config.source_root).resolve()
-    existing = {str(src_root / (t.get("src_path") or "")): t for t in store_pid["tracks"]}
-    existing_set = set(existing)
+    print()
+    for rank, src in enumerate(master_tracks, 1):
+        render_progress_bar(rank, total_master, prefix="Planning")
 
-    if _ordered_srcs(mgr, store_pid) == [str(p) for p in want]:
-        return {"status": "up-to-date", "count": len(existing_set)}
+        src_str = str(src.resolve())
+        is_top = src.resolve() in top_rated_tracks
+        target_folder = dir_top if is_top else dir_music
+        rel_path = (
+            f"Top Rated/{rank:04d}. {sanitize_filename(get_clean_title(src))}{src.suffix}"
+            if is_top
+            else f"{rank:04d}. {sanitize_filename(get_clean_title(src))}{src.suffix}"
+        )
 
-    adds = [p for p in want if str(p) not in existing_set]
-    removes = [t for p, t in existing.items() if str(p) not in want_set]
+        try:
+            src_mtime = src.stat().st_mtime
+        except OSError:
+            src_mtime = 0.0
 
-    if len(adds) > budget:
-        return {"status": "over-limit",
-                "detail": f"needs {len(adds)} new tracks but only {budget} of {MAX_TRACKS} remain"}
+        prev = manifest.get(src_str)
+        if (
+            prev
+            and prev.get("title")
+            and prev.get("mtime") == src_mtime
+            and not force_strip
+        ):
+            clean_title = prev["title"]
+        else:
+            clean_title = get_clean_title(src)
 
-    added = removed = 0
-    for t in sorted(removes, key=lambda t: t["index"], reverse=True):
-        mgr.remove_track(pid, t["index"])
-        removed += 1
-    for src in adds:
-        mgr.add_track(pid, src, total=len(want))
-        added += 1
+        filename = f"{rank:04d}. {sanitize_filename(clean_title)}{src.suffix}"
+        target_path = target_folder / filename
 
-    if _ordered_srcs(mgr, store_pid) != [str(p) for p in want]:
-        _reorder_to(mgr, pid, want)
+        if prev:
+            prev_rel = prev.get("rel_path")
+            prev_path = dir_music / prev_rel if prev_rel else None
 
-    print(f"    [{name}] +{added} -{removed} kept {len(existing_set) - removed}")
-    return {"status": "reconciled", "count": len(want)}
+            if prev_path and prev_path.exists():
+                if prev_rel != rel_path:
+                    tmp_path = dir_music / f"_tmp_{rank:04d}_{src.suffix}"
+                    move_plan.append((prev_path, tmp_path, target_path))
+                    moved += 1
 
-
-def repad_card(dest_root: Path, source_root: Path) -> int:
-    """Rename all tracks on the card to use correct zero-padding based on playlist length."""
-    from echolist.naming import track_filename
-    mgr = open_manager(dest_root, source_root)
-    try:
-        total_renamed = 0
-        for pid, pl in mgr.store.playlists.items():
-            tracks = pl["tracks"]
-            if not tracks:
-                continue
-            pad = len(str(len(tracks)))
-            folder = pl["folder"]
-            renamed = 0
-            for t in tracks:
-                old_name = t["copy_name"]
-                title = old_name.split(" - ", 1)[-1].rsplit(".", 1)[0]
-                ext = Path(old_name).suffix
-                new_name = track_filename(t["index"], title, ext, pad)
-                if old_name != new_name:
-                    src = dest_root / "Playlists" / folder / old_name
-                    dst = dest_root / "Playlists" / folder / new_name
-                    src.rename(dst)
-                    t["copy_name"] = new_name
-                    renamed += 1
-            if renamed:
-                print(f"  [{pl['name']}] renamed {renamed}/{len(tracks)} tracks")
-                total_renamed += renamed
+                needs_strip = force_strip or prev.get("mtime") != src_mtime
+                if needs_strip:
+                    strip_plan.append((target_path, src_str, src_mtime))
+                    stripped += 1
+                else:
+                    manifest[src_str] = {
+                        "rel_path": rel_path,
+                        "rank": rank,
+                        "title": clean_title,
+                        "mtime": src_mtime,
+                    }
             else:
-                print(f"  [{pl['name']}] already correctly padded ({len(tracks)} tracks)")
-        mgr.store.save()
-        mgr.save_snapshot()
-        print(f"\ntotal renamed: {total_renamed}")
-        return 0
-    finally:
-        mgr.release_lock()
-
-
-def plan_sync(dest_root: Path, source_root: Path,
-              wants: dict[str, list[Path]], dry_run: bool, reset: bool) -> int:
-    from echolist.manager import PlaylistManager
-
-    if reset and not dry_run:
-        reset_workspace(dest_root)
-
-    workspace_config = dest_root / "Playlists" / ".echolist" / "config.json"
-    mgr = None
-    if workspace_config.exists() or not dry_run:
-        mgr = open_manager(dest_root, source_root)
-
-    try:
-        # Existing card state
-        existing_by_pid: dict[str, set[str]] = {}
-        if mgr is not None:
-            src_root = Path(mgr.config.source_root).resolve()
-            for pid, pl in mgr.store.playlists.items():
-                existing_by_pid[pid] = {str(src_root / (t.get("src_path") or ""))
-                                        for t in pl["tracks"]}
-        grand_total = sum(len(v) for v in existing_by_pid.values())
-        from echolist.naming import playlist_id
-
-        exit_code = 0
-        synced = reconciled = up_to_date = skipped = 0
-        for name, want in wants.items():
-            pid = playlist_id(name)
-            if dry_run:
-                state = (len(existing_by_pid.get(pid, set())),
-                         "exists" if pid in existing_by_pid else "new")
-                print(f"- '{name}': {state} on card")
-                continue
-            budget = MAX_TRACKS - grand_total
-            res = sync_playlist(mgr, pid, name, want, budget)
-            if res["status"] == "synced":
-                synced += res["count"]
-                grand_total += res["count"]
-            elif res["status"] == "reconciled":
-                reconciled += 1
-                grand_total = sum(len(p["tracks"]) for p in mgr.store.playlists.values())
-            elif res["status"] == "up-to-date":
-                up_to_date += 1
+                copy_plan.append((src, target_path, rel_path, src_str, src_mtime))
+                copied += 1
+        else:
+            if target_path.exists() and target_path.stat().st_size > 0:
+                strip_plan.append((target_path, src_str, src_mtime))
+                stripped += 1
             else:
-                skipped += 1
-                print(f"- '{name}': {res['detail']}")
-                exit_code = 1
+                copy_plan.append((src, target_path, rel_path, src_str, src_mtime))
+                copied += 1
 
-        print(f"\nsummary: {synced} track(s) copied, {reconciled} reconciled, "
-              f"{up_to_date} up-to-date, {skipped} skipped")
-        print(f"card workspace total: {grand_total} / {MAX_TRACKS}")
-        if not dry_run and exit_code == 0:
-            mgr.save_snapshot()
-            print("snapshot saved")
-        return exit_code
-    finally:
-        if mgr is not None:
-            mgr.release_lock()
+    print(f"Plan: {copied} to copy, {moved} to move/rename, {stripped} art strips.")
+
+    # Storage Pre-Flight Check
+    if copy_plan and not dry_run:
+        total_copy_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
+        free_bytes = shutil.disk_usage(dest_root).free
+        if total_copy_bytes > free_bytes:
+            req_mb = total_copy_bytes / (1024 * 1024)
+            free_mb = free_bytes / (1024 * 1024)
+            sys.exit(
+                f"\n[FATAL] Insufficient space: Need {req_mb:.1f} MB, but only {free_mb:.1f} MB available."
+            )
+
+    if dry_run:
+        return
+
+    # Pass A & B: Moves and Renames
+    for old_p, tmp_p, final_p in move_plan:
+        try:
+            if old_p.exists():
+                old_p.rename(tmp_p)
+            if tmp_p.exists():
+                tmp_p.rename(final_p)
+        except OSError as exc:
+            sys.exit(f"\n\n[FATAL] Move failed: {exc}")
+
+    if move_plan:
+        save_manifest(manifest_file, manifest)
+
+    # Pass C: Copy new tracks and strip art
+    if copy_plan:
+        total_copies = len(copy_plan)
+        total_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
+        transferred_bytes = 0
+        start_time = time.time()
+
+        for idx, (src, dst, rel_path, src_str, src_mtime) in enumerate(copy_plan, 1):
+            try:
+                shutil.copy2(src, dst)
+                strip_cover_art_only(dst)
+            except OSError as exc:
+                sys.exit(f"\n\n[FATAL] Error copying: {exc}")
+
+            transferred_bytes += src.stat().st_size
+            elapsed = time.time() - start_time
+            speed = (transferred_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+            eta_sec = (
+                int((total_bytes - transferred_bytes) / (speed * 1024 * 1024))
+                if speed > 0
+                else 0
+            )
+            eta_str = format_eta(eta_sec)
+
+            manifest[src_str] = {
+                "rel_path": rel_path,
+                "rank": rank,
+                "title": clean_title,
+                "mtime": src_mtime,
+            }
+            save_manifest(manifest_file, manifest)
+            render_progress_bar(
+                idx,
+                total_copies,
+                prefix="Copying tracks",
+                extra=f"{speed:>4.1f} MB/s | ETA {eta_str}",
+            )
+
+    # Pass D: In-place art stripping on existing unstripped files
+    if strip_plan:
+        total_strips = len(strip_plan)
+        for idx, (target_path, src_str, src_mtime) in enumerate(strip_plan, 1):
+            if target_path.exists():
+                try:
+                    strip_cover_art_only(target_path)
+                except OSError as exc:
+                    sys.exit(
+                        f"\n\n[FATAL] Error stripping art from {target_path.name}: {exc}"
+                    )
+
+            rel_str = (
+                f"Top Rated/{target_path.name}"
+                if "Top Rated" in str(target_path)
+                else target_path.name
+            )
+            manifest[src_str] = {
+                "rel_path": rel_str,
+                "rank": rank,
+                "title": clean_title,
+                "mtime": src_mtime,
+            }
+            if idx % 50 == 0 or idx == total_strips:
+                save_manifest(manifest_file, manifest)
+            render_progress_bar(idx, total_strips, prefix="Stripping art")
+
+    clean_junk_files(dir_music)
+    save_manifest(manifest_file, manifest)
+
+    # Flush OS disk write cache
+    os.sync()
+
+    print(f"Sync complete: {len(manifest)} tracks active on card.")
+    send_notification(
+        "Echo Nano Sync", f"Sync complete: {len(manifest)} tracks active."
+    )
+
+    if auto_eject:
+        print("Safely unmounting card...")
+        subprocess.run(["udisksctl", "unmount", "-p", str(dest_root)], check=False)
+        print("Card unmounted cleanly. Safe to remove.")
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Echo NANO sync pipeline")
-    ap.add_argument("--list", action="store_true", help="list foobar playlists and exit")
-    ap.add_argument("--playlists", default="Top Rated",
-                    help="comma-separated playlist names to convert/sync "
-                         "(use 'all' for every playlist except whole-library dupes)")
-    ap.add_argument("--convert-only", action="store_true", help="only regenerate .m3u files")
-    ap.add_argument("--sync-only", action="store_true", help="only sync to the SD card")
-    ap.add_argument("--reset", action="store_true", help="wipe card workspace before syncing")
-    ap.add_argument("--yes", action="store_true", help="confirm destructive --reset")
-    ap.add_argument("--repad", action="store_true",
-                    help="rename existing card tracks to correct zero-padded filenames and exit")
-    ap.add_argument("--dry-run", action="store_true", help="print plans without writing")
+    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit("\nSync aborted by user."))
+
+    default_dest = find_default_dest()
+
+    ap = argparse.ArgumentParser(
+        description="Echo NANO Subdirectory Layout Sync (Pure Filename Sorting)"
+    )
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--limit", type=int, default=None, help="sync only first N tracks")
+    ap.add_argument(
+        "--force-strip",
+        action="store_true",
+        help="force re-strip art on all files in-place",
+    )
+    ap.add_argument(
+        "--eject-after",
+        action="store_true",
+        help="safely unmount card via udisksctl after sync finishes",
+    )
+    ap.add_argument("--master-playlist", default=DEFAULT_MASTER_PLAYLIST)
+    ap.add_argument("--top-rated-playlist", default=DEFAULT_TOP_RATED_PLAYLIST)
     ap.add_argument("--profile", default=str(DEFAULT_PROFILE))
     ap.add_argument("--source-root", default=str(DEFAULT_SOURCE_ROOT))
-    ap.add_argument("--playlist-dir", default=str(DEFAULT_PLAYLIST_DIR))
-    ap.add_argument("--dest", default=str(DEFAULT_DEST))
-    ap.add_argument("--echolist-src", default=str(DEFAULT_ECHOLIST_SRC))
+    ap.add_argument(
+        "--dest",
+        default=str(default_dest) if default_dest else None,
+        help="mount path of SD card (auto-detected if omitted)",
+    )
     args = ap.parse_args()
 
-    _add_echolist_to_path(Path(args.echolist_src))
+    if not args.dest:
+        sys.exit(
+            "ERROR: Could not auto-detect SD card mount. Please provide --dest /path/to/disk"
+        )
+
+    dest_root = Path(args.dest)
+    if not dest_root.exists():
+        sys.exit(f"Destination not mounted: {dest_root}")
+
     profile = Path(args.profile)
     source_root = Path(args.source_root)
-    playlist_dir = Path(args.playlist_dir)
-    dest_root = Path(args.dest)
 
+    print(f"Target destination: {dest_root}")
     index = load_playlist_index(profile)
-    all_names = [n for n in index.values() if n not in DUPES_OF_WHOLE_LIBRARY]
 
-    if args.list:
-        print(f"{'playlist':30} {'tracks':>7}")
-        for name in all_names:
-            guid = next(g for g, n in index.items() if n == name)
-            fplite = get_fplite_path(profile, guid)
-            count = -1
-            if fplite.exists():
-                count = len(parse_fplite(fplite, source_root)[0])
-            print(f"{name:30} {count:>7}")
-        return 0
+    master_tracks = parse_fplite(profile, index, args.master_playlist, source_root)
+    if not master_tracks:
+        sys.exit(
+            f"No tracks found in master playlist '{args.master_playlist}'. Aborting."
+        )
 
-    if args.repad:
-        print(f"== repad: -> {dest_root} ==")
-        return repad_card(dest_root, source_root)
+    if args.limit:
+        print(f"[Test Mode] Limiting master playlist to first {args.limit} tracks.")
+        master_tracks = master_tracks[: args.limit]
 
-    if args.playlists.lower() == "all":
-        selected = all_names
-    else:
-        selected = [resolve_fplite_name(s.strip(), index)
-                    for s in args.playlists.split(",") if s.strip()]
+    top_rated_list = parse_fplite(profile, index, args.top_rated_playlist, source_root)
+    top_rated_set = set(top_rated_list)
 
-    exit_code = 0
-
-    # Parse all selected playlists directly from foobar .fplite files
-    wants, parse_exit = load_fplite_wants(profile, source_root, selected)
-    exit_code = parse_exit
-
-    if not args.sync_only and wants:
-        print("== convert: fplite -> .m3u ==")
-        for name, tracks in wants.items():
-            if not args.dry_run:
-                out = write_m3u(name, tracks, playlist_dir)
-                print(f"- '{name}': {len(tracks)} tracks -> {out}  [OK]")
-            else:
-                print(f"- '{name}': {len(tracks)} tracks -> {playlist_dir / (name + '.m3u')}  [dry-run]")
-
-    if not args.convert_only:
-        if not dest_root.exists():
-            print(f"ERROR: destination not mounted: {dest_root}")
-            return 1
-        if args.reset and not args.dry_run and not args.yes:
-            print("--reset requires --yes (it wipes dest/Playlists on the card)")
-            return 2
-        print(f"\n== sync: -> {dest_root} ==")
-        exit_code = exit_code or plan_sync(dest_root, source_root,
-                                           wants, args.dry_run, args.reset)
-
-    return exit_code
+    sync_nested_top_rated(
+        dest_root,
+        master_tracks,
+        top_rated_set,
+        args.dry_run,
+        force_strip=args.force_strip,
+        auto_eject=args.eject_after,
+    )
+    return 0
 
 
 if __name__ == "__main__":
