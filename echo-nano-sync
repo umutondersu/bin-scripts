@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Echo NANO Subdirectory Layout Sync (Pure Filename Sorting Edition).
+"""Echo NANO Subdirectory Layout Sync.
 
-- Places Top Rated tracks into /Music/Top Rated/<rank>. <Title>.<ext>
-- Places remaining tracks into /Music/<rank>. <Title>.<ext>
-- Total tracks remain exactly 7,815 (under 8,192 limit).
-- All metadata tags (TITLE, ARTIST, ALBUM, GENRE) left 100% untouched.
-- Strips embedded cover art to optimize SD card storage.
-- Pre-flight storage checks & automatic FAT32 dot-file cleanup.
-- OS write-cache sync + optional auto-eject (--eject-after).
-- Human-readable ETA formatting (HH:MM:SS / MM:SS).
-- Desktop notification on complete.
+Synchronizes foobar2000 'Top Rated' and 'Library Sorted' playlists
+using a nested folder layout:
+- Curated favorite tracks are placed into /Music/<Favorite Playlist>/
+- Remaining library tracks are placed into /Music/
+- Zero-padded track numbering ensures consistent playback order across views.
+- Strips embedded cover art across common formats to optimize flash storage.
+- Tracks sync state atomically using on-card with a JSON manifest.
 """
 
 from __future__ import annotations
@@ -22,6 +20,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -41,7 +40,7 @@ GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
 
 
 def format_eta(seconds: int) -> str:
-    """Format seconds into human-readable HH:MM:SS or MM:SS."""
+    """Format seconds into HH:MM:SS or MM:SS."""
     if seconds < 0 or seconds > 86400 * 7:
         return "--:--"
     hrs, remainder = divmod(seconds, 3600)
@@ -58,6 +57,7 @@ def render_progress_bar(
     length: int = 24,
     extra: str = "",
 ) -> None:
+    """Render a terminal progress bar with percentage and optional stats."""
     if total <= 0:
         return
     percent = current / total
@@ -73,11 +73,13 @@ def render_progress_bar(
 
 
 def send_notification(title: str, msg: str) -> None:
+    """Send a desktop notification via libnotify if available."""
     if shutil.which("notify-send"):
         subprocess.run(["notify-send", "-a", "Echo Sync", title, msg], check=False)
 
 
 def find_default_dest() -> Path | None:
+    """Auto-detect mounted removable storage path on Linux and macOS."""
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or HOME.name
     search_roots = [Path("/run/media") / user, Path("/media") / user, Path("/Volumes")]
     for root in search_roots:
@@ -89,13 +91,15 @@ def find_default_dest() -> Path | None:
 
 
 def sanitize_filename(name: str) -> str:
+    """Remove filesystem-illegal characters from a filename string."""
     return re.sub(r'[\\/*?:"<>|]', "", name).strip()
 
 
 def load_playlist_index(profile: Path) -> dict[str, str]:
+    """Parse foobar2000 index.txt to map playlist GUIDs to playlist names."""
     index_file = profile / "playlists-v2.0" / "index.txt"
     if not index_file.exists():
-        sys.exit(f"foobar playlist index not found: {index_file}")
+        sys.exit(f"[FATAL] foobar playlist index not found: {index_file}")
     mapping: dict[str, str] = {}
     for line in index_file.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
@@ -107,12 +111,24 @@ def load_playlist_index(profile: Path) -> dict[str, str]:
 
 
 def get_global_file_index(source_root: Path) -> dict[str, list[Path]]:
+    """Build and cache a filename-to-path index of the source library."""
     global GLOBAL_FILE_INDEX
     if GLOBAL_FILE_INDEX is None:
         sys.stdout.write("Building file index fallback cache... ")
         sys.stdout.flush()
         GLOBAL_FILE_INDEX = {}
-        exts = {".flac", ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".ape"}
+        exts = {
+            ".flac",
+            ".mp3",
+            ".m4a",
+            ".ogg",
+            ".opus",
+            ".wav",
+            ".wave",
+            ".ape",
+            ".aif",
+            ".aiff",
+        }
         for p in source_root.rglob("*"):
             if p.suffix.lower() in exts:
                 GLOBAL_FILE_INDEX.setdefault(p.name.lower(), []).append(p)
@@ -123,20 +139,20 @@ def get_global_file_index(source_root: Path) -> dict[str, list[Path]]:
 def parse_fplite(
     profile: Path, index: dict[str, str], playlist_name: str, source_root: Path
 ) -> list[Path]:
+    """Extract and resolve audio file paths from a foobar2000 .fplite playlist."""
     guid = next(
         (g for g, n in index.items() if n.lower() == playlist_name.lower()), None
     )
     if not guid:
-        print(f"Warning: Playlist '{playlist_name}' not found in index.")
+        print(f"[Warning] Playlist '{playlist_name}' not found in index.")
         return []
 
     fplite = profile / "playlists-v2.0" / f"playlist-{guid}.fplite"
     if not fplite.exists():
-        print(f"Warning: Missing file {fplite.name}")
+        print(f"[Warning] Missing file {fplite.name}")
         return []
 
     tracks: list[Path] = []
-    OLD_PREFIXES = {"ZSingles", "Albums", "ZZExtra"}
 
     for raw in fplite.read_text(encoding="utf-8-sig").splitlines():
         line = raw.strip()
@@ -156,13 +172,6 @@ def parse_fplite(
             tracks.append(p.resolve())
             continue
 
-        parts = entry.split("/")
-        if parts[0] in OLD_PREFIXES:
-            p2 = source_root / "/".join(parts[1:])
-            if p2.is_file():
-                tracks.append(p2.resolve())
-                continue
-
         fname = Path(entry).name.lower()
         idx_cache = get_global_file_index(source_root)
         matches = idx_cache.get(fname, [])
@@ -173,6 +182,7 @@ def parse_fplite(
 
 
 def get_clean_title(path: Path) -> str:
+    """Extract audio title tag or fallback to sanitized filename."""
     raw_title = ""
     try:
         audio = mutagen.File(path)
@@ -199,31 +209,86 @@ def get_clean_title(path: Path) -> str:
     return clean or path.stem
 
 
-def strip_cover_art_only(dst_file: Path) -> None:
-    """Strip embedded cover art without modifying any audio tags."""
+def has_cover_art(file_path: Path) -> bool:
+    """Check whether an audio file contains embedded artwork metadata."""
+    suffix = file_path.suffix.lower()
     try:
-        suffix = dst_file.suffix.lower()
-
         if suffix == ".flac":
-            audio_flac = FLAC(dst_file)
-            if audio_flac.pictures:
-                audio_flac.clear_pictures()
-                audio_flac.save()
+            audio = FLAC(file_path)
+            return bool(audio.pictures)
 
-        elif suffix == ".mp3":
+        if suffix in {".mp3", ".wav", ".wave", ".aif", ".aiff"}:
+            tags = ID3(file_path)
+            return any(k.startswith("APIC") or k.startswith("PIC") for k in tags.keys())
+
+        if suffix in {".ogg", ".opus", ".oga"}:
+            audio = mutagen.File(file_path)
+            if audio is not None and getattr(audio, "tags", None):
+                return any(
+                    k.lower() in {"metadata_block_picture", "coverart", "coverartmime"}
+                    for k in audio.tags.keys()
+                )
+
+        if suffix in {".m4a", ".mp4", ".aac", ".alac"}:
+            audio = mutagen.File(file_path)
+            return bool(audio and audio.tags and "covr" in audio.tags)
+
+    except Exception:
+        return False
+
+    return False
+
+
+def remove_cover_art_from_file(file_path: Path) -> bool:
+    """Strip embedded cover art blocks across common audio formats."""
+    suffix = file_path.suffix.lower()
+    modified = False
+
+    try:
+        if suffix == ".flac":
+            audio = FLAC(file_path)
+            if audio.pictures:
+                audio.clear_pictures()
+                audio.save()
+                modified = True
+
+        elif suffix in {".mp3", ".wav", ".wave", ".aif", ".aiff"}:
             try:
-                tags = ID3(dst_file)
-                if any(k.startswith("APIC") for k in tags.keys()):
-                    tags.delall("APIC")
-                    tags.save(dst_file)
+                tags = ID3(file_path)
+                art_keys = [
+                    k
+                    for k in tags.keys()
+                    if k.startswith("APIC") or k.startswith("PIC")
+                ]
+                if art_keys:
+                    for k in art_keys:
+                        del tags[k]
+                    tags.save(file_path)
+                    modified = True
             except ID3NoHeaderError:
                 pass
 
-        elif suffix in {".m4a", ".mp4", ".aac"}:
-            audio = mutagen.File(dst_file)
+        elif suffix in {".ogg", ".opus", ".oga"}:
+            audio = mutagen.File(file_path)
+            if audio is not None and getattr(audio, "tags", None):
+                art_keys = [
+                    k
+                    for k in audio.tags.keys()
+                    if k.lower()
+                    in {"metadata_block_picture", "coverart", "coverartmime"}
+                ]
+                if art_keys:
+                    for k in art_keys:
+                        del audio.tags[k]
+                    audio.save()
+                    modified = True
+
+        elif suffix in {".m4a", ".mp4", ".aac", ".alac"}:
+            audio = mutagen.File(file_path)
             if audio and audio.tags and "covr" in audio.tags:
                 del audio.tags["covr"]
                 audio.save()
+                modified = True
 
     except Exception as exc:
         err_str = str(exc)
@@ -234,10 +299,29 @@ def strip_cover_art_only(dst_file: Path) -> None:
             or isinstance(exc, OSError)
         ):
             raise OSError(err_str) from exc
-        print(f"\n[Warning] Art strip skipped on {dst_file.name}: {exc}")
+        print(f"\n[Warning] Art strip skipped on {file_path.name}: {exc}")
+
+    return modified
+
+
+def copy_file(src: Path, dst: Path, tmp_dir: Path, strip_art: bool = True) -> None:
+    """Copy track to destination, optionally stripping art in local fast storage first."""
+    if not strip_art:
+        shutil.copyfile(src, dst)
+        return
+
+    tmp_file = tmp_dir / f"proc_{dst.name}"
+    try:
+        shutil.copyfile(src, tmp_file)
+        remove_cover_art_from_file(tmp_file)
+        shutil.copyfile(tmp_file, dst)
+    finally:
+        if tmp_file.exists():
+            tmp_file.unlink()
 
 
 def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
+    """Atomically persist synchronization state to JSON manifest."""
     try:
         tmp_manifest = manifest_file.with_suffix(".tmp")
         tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -247,7 +331,7 @@ def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
 
 
 def clean_junk_files(dir_music: Path) -> None:
-    """Strip OS-generated hidden dot-files from FAT32/exFAT."""
+    """Clean OS-generated metadata dot-files from removable drive."""
     for junk in dir_music.rglob("._*"):
         junk.unlink(missing_ok=True)
     for ds in dir_music.rglob(".DS_Store"):
@@ -260,12 +344,14 @@ def sync_nested_top_rated(
     top_rated_tracks: set[Path],
     dry_run: bool,
     force_strip: bool = False,
+    keep_cover_art: bool = False,
     auto_eject: bool = False,
 ) -> None:
+    """Plan and execute incremental synchronization to destination drive."""
     total_master = len(master_tracks)
     if total_master > MAX_TRACKS:
         sys.exit(
-            f"ERROR: Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
+            f"[FATAL] Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
         )
 
     dir_music = dest_root / "Music"
@@ -304,11 +390,11 @@ def sync_nested_top_rated(
     if stale_srcs and not dry_run:
         save_manifest(manifest_file, manifest)
 
-    # 2. Plan additions, moves, and in-place art stripping
+    # 2. Planning
     copied = moved = stripped = 0
     move_plan: list[tuple[Path, Path, Path]] = []
     copy_plan: list[tuple[Path, Path, str, str, float]] = []
-    strip_plan: list[tuple[Path, str, float]] = []
+    strip_plan: list[tuple[Path, str, float, str, int]] = []
 
     print()
     for rank, src in enumerate(master_tracks, 1):
@@ -317,11 +403,10 @@ def sync_nested_top_rated(
         src_str = str(src.resolve())
         is_top = src.resolve() in top_rated_tracks
         target_folder = dir_top if is_top else dir_music
-        rel_path = (
-            f"Top Rated/{rank:04d}. {sanitize_filename(get_clean_title(src))}{src.suffix}"
-            if is_top
-            else f"{rank:04d}. {sanitize_filename(get_clean_title(src))}{src.suffix}"
-        )
+        clean_title = get_clean_title(src)
+        filename = f"{rank:04d}. {sanitize_filename(clean_title)}{src.suffix}"
+        target_path = target_folder / filename
+        rel_path = f"Top Rated/{filename}" if is_top else filename
 
         try:
             src_mtime = src.stat().st_mtime
@@ -329,18 +414,6 @@ def sync_nested_top_rated(
             src_mtime = 0.0
 
         prev = manifest.get(src_str)
-        if (
-            prev
-            and prev.get("title")
-            and prev.get("mtime") == src_mtime
-            and not force_strip
-        ):
-            clean_title = prev["title"]
-        else:
-            clean_title = get_clean_title(src)
-
-        filename = f"{rank:04d}. {sanitize_filename(clean_title)}{src.suffix}"
-        target_path = target_folder / filename
 
         if prev:
             prev_rel = prev.get("rel_path")
@@ -352,9 +425,8 @@ def sync_nested_top_rated(
                     move_plan.append((prev_path, tmp_path, target_path))
                     moved += 1
 
-                needs_strip = force_strip or prev.get("mtime") != src_mtime
-                if needs_strip:
-                    strip_plan.append((target_path, src_str, src_mtime))
+                if not keep_cover_art and (force_strip or has_cover_art(prev_path)):
+                    strip_plan.append((target_path, src_str, src_mtime, rel_path, rank))
                     stripped += 1
                 else:
                     manifest[src_str] = {
@@ -368,15 +440,22 @@ def sync_nested_top_rated(
                 copied += 1
         else:
             if target_path.exists() and target_path.stat().st_size > 0:
-                strip_plan.append((target_path, src_str, src_mtime))
-                stripped += 1
+                if not keep_cover_art and (force_strip or has_cover_art(target_path)):
+                    strip_plan.append((target_path, src_str, src_mtime, rel_path, rank))
+                    stripped += 1
+                else:
+                    manifest[src_str] = {
+                        "rel_path": rel_path,
+                        "rank": rank,
+                        "title": clean_title,
+                        "mtime": src_mtime,
+                    }
             else:
                 copy_plan.append((src, target_path, rel_path, src_str, src_mtime))
                 copied += 1
 
     print(f"Plan: {copied} to copy, {moved} to move/rename, {stripped} art strips.")
 
-    # Storage Pre-Flight Check
     if copy_plan and not dry_run:
         total_copy_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
         free_bytes = shutil.disk_usage(dest_root).free
@@ -390,7 +469,7 @@ def sync_nested_top_rated(
     if dry_run:
         return
 
-    # Pass A & B: Moves and Renames
+    # Pass A & B: Moves
     for old_p, tmp_p, final_p in move_plan:
         try:
             if old_p.exists():
@@ -403,63 +482,68 @@ def sync_nested_top_rated(
     if move_plan:
         save_manifest(manifest_file, manifest)
 
-    # Pass C: Copy new tracks and strip art
+    # Pass C: Copy with local buffer & batched manifest updates
     if copy_plan:
         total_copies = len(copy_plan)
         total_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
         transferred_bytes = 0
         start_time = time.time()
 
-        for idx, (src, dst, rel_path, src_str, src_mtime) in enumerate(copy_plan, 1):
-            try:
-                shutil.copy2(src, dst)
-                strip_cover_art_only(dst)
-            except OSError as exc:
-                sys.exit(f"\n\n[FATAL] Error copying: {exc}")
+        with tempfile.TemporaryDirectory(prefix="echonano_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            for idx, (src, dst, rel_path, src_str, src_mtime) in enumerate(
+                copy_plan, 1
+            ):
+                try:
+                    copy_file(src, dst, tmp_dir, strip_art=not keep_cover_art)
+                except OSError as exc:
+                    sys.exit(f"\n\n[FATAL] Error copying {src.name}: {exc}")
 
-            transferred_bytes += src.stat().st_size
-            elapsed = time.time() - start_time
-            speed = (transferred_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-            eta_sec = (
-                int((total_bytes - transferred_bytes) / (speed * 1024 * 1024))
-                if speed > 0
-                else 0
-            )
-            eta_str = format_eta(eta_sec)
+                transferred_bytes += src.stat().st_size
+                elapsed = time.time() - start_time
+                speed = (
+                    (transferred_bytes / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                )
+                eta_sec = (
+                    int((total_bytes - transferred_bytes) / (speed * 1024 * 1024))
+                    if speed > 0
+                    else 0
+                )
+                eta_str = format_eta(eta_sec)
 
-            manifest[src_str] = {
-                "rel_path": rel_path,
-                "rank": rank,
-                "title": clean_title,
-                "mtime": src_mtime,
-            }
-            save_manifest(manifest_file, manifest)
-            render_progress_bar(
-                idx,
-                total_copies,
-                prefix="Copying tracks",
-                extra=f"{speed:>4.1f} MB/s | ETA {eta_str}",
-            )
+                manifest[src_str] = {
+                    "rel_path": rel_path,
+                    "rank": rank,
+                    "title": clean_title,
+                    "mtime": src_mtime,
+                }
 
-    # Pass D: In-place art stripping on existing unstripped files
+                if idx % 50 == 0 or idx == total_copies:
+                    save_manifest(manifest_file, manifest)
+
+                render_progress_bar(
+                    idx,
+                    total_copies,
+                    prefix="Copying tracks",
+                    extra=f"{speed:>4.1f} MB/s | ETA {eta_str}",
+                )
+
+    # Pass D: Strip art on existing files
     if strip_plan:
         total_strips = len(strip_plan)
-        for idx, (target_path, src_str, src_mtime) in enumerate(strip_plan, 1):
+        for idx, (target_path, src_str, src_mtime, rel_path, rank) in enumerate(
+            strip_plan, 1
+        ):
             if target_path.exists():
                 try:
-                    strip_cover_art_only(target_path)
+                    remove_cover_art_from_file(target_path)
                 except OSError as exc:
                     sys.exit(
                         f"\n\n[FATAL] Error stripping art from {target_path.name}: {exc}"
                     )
 
-            rel_str = (
-                f"Top Rated/{target_path.name}"
-                if "Top Rated" in str(target_path)
-                else target_path.name
-            )
             manifest[src_str] = {
-                "rel_path": rel_str,
+                "rel_path": rel_path,
                 "rank": rank,
                 "title": clean_title,
                 "mtime": src_mtime,
@@ -471,7 +555,7 @@ def sync_nested_top_rated(
     clean_junk_files(dir_music)
     save_manifest(manifest_file, manifest)
 
-    # Flush OS disk write cache
+    print("\nFlushing filesystem write buffers to SD card...")
     os.sync()
 
     print(f"Sync complete: {len(manifest)} tracks active on card.")
@@ -486,15 +570,26 @@ def sync_nested_top_rated(
 
 
 def main() -> int:
-    signal.signal(signal.SIGINT, lambda sig, frame: sys.exit("\nSync aborted by user."))
+    """CLI entrypoint."""
+    signal.signal(
+        signal.SIGINT,
+        lambda sig, frame: sys.exit("\nSync aborted by user (progress preserved)."),
+    )
 
     default_dest = find_default_dest()
 
-    ap = argparse.ArgumentParser(
-        description="Echo NANO Subdirectory Layout Sync (Pure Filename Sorting)"
+    ap = argparse.ArgumentParser(description="Echo NANO Subdirectory Layout Sync")
+    ap.add_argument(
+        "--dry-run", action="store_true", help="preview actions without writing"
     )
-    ap.add_argument("--dry-run", action="store_true")
-    ap.add_argument("--limit", type=int, default=None, help="sync only first N tracks")
+    ap.add_argument(
+        "--limit", type=int, default=None, help="sync only the first N tracks"
+    )
+    ap.add_argument(
+        "--keep-cover-art",
+        action="store_true",
+        help="do not strip embedded cover art during sync",
+    )
     ap.add_argument(
         "--force-strip",
         action="store_true",
@@ -503,12 +598,26 @@ def main() -> int:
     ap.add_argument(
         "--eject-after",
         action="store_true",
-        help="safely unmount card via udisksctl after sync finishes",
+        help="safely unmount card via udisksctl on completion",
     )
-    ap.add_argument("--master-playlist", default=DEFAULT_MASTER_PLAYLIST)
-    ap.add_argument("--top-rated-playlist", default=DEFAULT_TOP_RATED_PLAYLIST)
-    ap.add_argument("--profile", default=str(DEFAULT_PROFILE))
-    ap.add_argument("--source-root", default=str(DEFAULT_SOURCE_ROOT))
+    ap.add_argument(
+        "--master-playlist",
+        default=DEFAULT_MASTER_PLAYLIST,
+        help="master full library playlist name",
+    )
+    ap.add_argument(
+        "--top-rated-playlist",
+        default=DEFAULT_TOP_RATED_PLAYLIST,
+        help="favorites playlist name",
+    )
+    ap.add_argument(
+        "--profile", default=str(DEFAULT_PROFILE), help="foobar2000 profile directory"
+    )
+    ap.add_argument(
+        "--source-root",
+        default=str(DEFAULT_SOURCE_ROOT),
+        help="local music root directory",
+    )
     ap.add_argument(
         "--dest",
         default=str(default_dest) if default_dest else None,
@@ -518,12 +627,12 @@ def main() -> int:
 
     if not args.dest:
         sys.exit(
-            "ERROR: Could not auto-detect SD card mount. Please provide --dest /path/to/disk"
+            "[FATAL] Could not auto-detect SD card mount. Please provide --dest /path/to/disk"
         )
 
     dest_root = Path(args.dest)
     if not dest_root.exists():
-        sys.exit(f"Destination not mounted: {dest_root}")
+        sys.exit(f"[FATAL] Destination not mounted: {dest_root}")
 
     profile = Path(args.profile)
     source_root = Path(args.source_root)
@@ -534,7 +643,7 @@ def main() -> int:
     master_tracks = parse_fplite(profile, index, args.master_playlist, source_root)
     if not master_tracks:
         sys.exit(
-            f"No tracks found in master playlist '{args.master_playlist}'. Aborting."
+            f"[FATAL] No tracks found in master playlist '{args.master_playlist}'. Aborting."
         )
 
     if args.limit:
@@ -550,6 +659,7 @@ def main() -> int:
         top_rated_set,
         args.dry_run,
         force_strip=args.force_strip,
+        keep_cover_art=args.keep_cover_art,
         auto_eject=args.eject_after,
     )
     return 0

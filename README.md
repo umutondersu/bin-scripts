@@ -62,19 +62,18 @@ foobar2000 ~/Music/*.mp3
 
 ### 🎶 echo-nano-sync
 
-Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP SD card using a nested-directory layout.
+Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP using a nested-directory layout.
 
-The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. This script organizes files into a nested directory structure so you get 1-click access to curated favorites while keeping full library playback in chronological order—without duplicating files or mangling audio metadata.
+The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. This script organizes tracks into a nested directory layout so curated favorites can be accessed via folder navigation while keeping full-library chronological playback intact without duplicating files.
 
-**Architecture & How it Works:**
+**Architecture & How It Works:**
 
-* **Zero Metadata Mangling:** Leaves all audio tags (`TITLE`, `ARTIST`, `ALBUM`, `GENRE`) completely untouched.
-* **Embedded Cover Art Stripping:** Automatically removes high-resolution embedded images (`APIC`, `covr`, FLAC pictures) to optimize storage on FAT32/exFAT.
-* **Top Rated (`Storage > TF Card > Music > Top Rated`):** 4★+ songs live in `/Music/Top Rated/` for direct, single-click folder browsing.
-* **All Songs (`Category > All Songs`):** Recursively indexes `/Music/` and `/Music/Top Rated/`, playing the entire collection sorted by zero-padded filename rank (`0001.`, `0002.`, …) in exact foobar2000 reverse-date order.
-* **Zero Duplicate Files:** Keeps all tracks as single physical files, comfortably staying within the 8,192-track limit.
-* **Incremental & Resumable:** Tracks state on-card in `.manifest_nested.json` after every write. Safe to interrupt with `Ctrl+C` and resume anytime.
-* **Safety Checks:** Pre-flight free storage validation, auto-cleanup of OS junk files (`.DS_Store`, `._*`), write-cache flushing (`os.sync()`), and optional auto-eject.
+* **Favorites Direct Access (`Storage > TF Card > Music > <Favorites>`):** Favorite tracks are placed into `/Music/<Favorite Playlist>/` for 1-click folder browsing.
+* **Full Library Order (`Category > All Songs`):** Recursively indexes `/Music/`, sorting the entire collection by zero-padded filename rank (`0001.`, `0002.`, …) in foobar2000 playlist order.
+* **Zero Duplicate Files:** Tracks exist as single physical files on disk to stay safely below the 8,192-file firmware indexing limit.
+* **Embedded Cover Art Stripping:** Automatically removes embedded images across FLAC, MP3, WAV, OGG, OPUS, and M4A to save flash storage (can be disabled with `--keep-cover-art`).
+* **Fully Idempotent & Incremental:** Inspects actual on-disk state and records progress to an on-card `.manifest_nested.json` manifest. Safe to cancel with `Ctrl+C` and resume anytime.
+* **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT dot-file cleanup (`.DS_Store`, `._*`), filesystem write-cache sync (`os.sync()`), and optional post-sync unmounting.
 
 **Defaults** (auto-detected or overridden via CLI):
 
@@ -91,10 +90,12 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 ```bash
 echo-nano-sync                         # Incremental sync of library to auto-detected SD card
 echo-nano-sync --eject-after           # Sync and safely unmount the card with udisksctl on completion
+echo-nano-sync --keep-cover-art        # Preserve embedded album artwork in audio files
 echo-nano-sync --dry-run               # Preview plan (copies, moves, art strips) without writing
-echo-nano-sync --limit 20              # Sync only the first 20 tracks (useful for fast verification)
+echo-nano-sync --limit 20              # Sync only the first 20 tracks (useful for test runs)
 echo-nano-sync --force-strip           # Force re-check and strip embedded art from all files on card
 echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
+
 ```
 
 **Requirements:**
@@ -103,6 +104,7 @@ echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
 * foobar2000 (Wine) with playlists saved in `.fplite` format
 * `udisksctl` (optional, for `--eject-after`)
 * `libnotify` / `notify-send` (optional, for desktop notifications)
+
 
 ---
 
