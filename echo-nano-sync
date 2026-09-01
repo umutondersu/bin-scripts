@@ -2,10 +2,11 @@
 """Echo NANO Subdirectory Layout Sync.
 
 Synchronizes foobar2000 'Top Rated' and 'Library Sorted' playlists
-using a nested folder layout:
-- Curated favorite tracks are placed into /Music/<Favorite Playlist>/
-- Remaining library tracks are placed into /Music/
-- Zero-padded track numbering ensures consistent playback order across views.
+using a flat folder layout:
+- Curated favorite tracks are placed into /Top Rated/
+- Remaining library tracks are placed at the card root
+- Zero-padded track numbering, plus a fatsort pass, keeps playback order
+  correct in the Nano's File Browser (which sorts by raw directory order).
 - Strips embedded cover art across common formats to optimize flash storage.
 - Tracks sync state atomically using on-card with a JSON manifest.
 """
@@ -187,13 +188,26 @@ def get_clean_title(path: Path) -> str:
     try:
         audio = mutagen.File(path)
         if audio is not None:
-            if hasattr(audio, "tags") and audio.tags:
-                if "TIT2" in audio.tags:
-                    raw_title = str(audio.tags["TIT2"])
-                elif "\xa9nam" in audio.tags:
-                    raw_title = str(audio.tags["\xa9nam"][0])
-            if not raw_title and "title" in audio:
-                raw_title = str(audio["title"][0])
+            tags = getattr(audio, "tags", None)
+            if tags:
+                for key in ("title", "TIT2", "\xa9nam"):
+                    try:
+                        if key in tags:
+                            val = tags[key]
+                            if isinstance(val, (list, tuple)) and val:
+                                raw_title = str(val[0]).strip()
+                            else:
+                                raw_title = str(val).strip()
+                            if raw_title:
+                                break
+                    except Exception:
+                        continue
+            if not raw_title:
+                try:
+                    if "title" in audio:
+                        raw_title = str(audio["title"][0]).strip()
+                except Exception:
+                    pass
     except Exception:
         pass
 
@@ -330,12 +344,89 @@ def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
         sys.exit(f"\n\n[FATAL] Failed to save manifest: {exc}")
 
 
-def clean_junk_files(dir_music: Path) -> None:
-    """Clean OS-generated metadata dot-files from removable drive."""
-    for junk in dir_music.rglob("._*"):
-        junk.unlink(missing_ok=True)
-    for ds in dir_music.rglob(".DS_Store"):
-        ds.unlink(missing_ok=True)
+def clean_junk_files(root: Path) -> None:
+    """Clean OS-generated metadata files/dirs from the removable drive."""
+    patterns = (
+        "._*",
+        ".DS_Store",
+        ".Spotlight-V100",
+        ".fseventsd",
+        ".Trashes",
+        ".Trash-*",
+        "Thumbs.db",
+        ".apdisk",
+    )
+    for pat in patterns:
+        for junk in list(root.rglob(pat)):
+            try:
+                if junk.is_dir():
+                    shutil.rmtree(junk)
+                else:
+                    junk.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def resolve_block_device(mountpoint: Path) -> str | None:
+    """Resolve the block device backing a mount point."""
+    try:
+        out = subprocess.run(
+            ["findmnt", "-n", "-o", "SOURCE", str(mountpoint)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        dev = out.stdout.strip()
+        return dev if dev.startswith("/dev/") else None
+    except Exception:
+        return None
+
+
+def sort_card(dest_root: Path) -> None:
+    """Unmount, repair, and sort the card's directory entries; leave it unmounted."""
+    dev = resolve_block_device(dest_root)
+    if not dev:
+        print("[Warning] Could not resolve block device; skipping directory sort.")
+        return
+    if not shutil.which("fatsort"):
+        print("[Warning] 'fatsort' not installed; Nano folder order may be incorrect.")
+        return
+    if not shutil.which("sudo"):
+        print("[Warning] 'sudo' not found; skipping directory sort.")
+        return
+
+    if shutil.which("fsck.fat"):
+        fsck_line = (
+            f"fsck.fat -a {dev}\n"
+            "rc=$?\n"
+            'if [ $rc -gt 1 ]; then echo "fsck failed (code $rc); skipping sort" >&2; exit $rc; fi\n'
+        )
+    else:
+        print("[Warning] 'fsck.fat' not found; skipping filesystem check.")
+        fsck_line = ""
+
+    print("\nUnmounting card for directory sort...")
+    if subprocess.run(["udisksctl", "unmount", "-b", dev], check=False).returncode != 0:
+        print("[Warning] Failed to unmount card; skipping directory sort.")
+        return
+
+    subprocess.run(["sudo", "-v"], check=False)
+    script = fsck_line + f"fatsort -n {dev}\n"
+    print("Checking filesystem and sorting directory entries...")
+    result = subprocess.run(["sudo", "sh", "-c", script], check=False)
+    if result.returncode != 0:
+        print("[Warning] Directory sort did not complete; card left unmounted.")
+        return
+    print("Card sorted and left unmounted. Safe to remove.")
+
+
+def cache_sudo_credentials() -> None:
+    """Prompt for the sudo password once, up front, so later sort steps run silently."""
+    if not shutil.which("sudo") or not shutil.which("fatsort"):
+        return
+    print("Requesting sudo for the directory-sort step (enter password once)...")
+    if subprocess.run(["sudo", "-v"], check=False).returncode != 0:
+        print("[Warning] Could not cache sudo credentials; you may be prompted again.")
 
 
 def sync_nested_top_rated(
@@ -345,7 +436,6 @@ def sync_nested_top_rated(
     dry_run: bool,
     force_strip: bool = False,
     keep_cover_art: bool = False,
-    auto_eject: bool = False,
 ) -> None:
     """Plan and execute incremental synchronization to destination drive."""
     total_master = len(master_tracks)
@@ -354,17 +444,16 @@ def sync_nested_top_rated(
             f"[FATAL] Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
         )
 
-    dir_music = dest_root / "Music"
-    dir_top = dir_music / "Top Rated"
+    dir_root = dest_root
+    dir_top = dest_root / "Top Rated"
 
     if not dry_run:
         try:
-            dir_music.mkdir(parents=True, exist_ok=True)
             dir_top.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             sys.exit(f"[FATAL] Cannot create target directories: {exc}")
 
-    manifest_file = dir_music / ".manifest_nested.json"
+    manifest_file = dir_root / ".manifest_nested.json"
     manifest: dict[str, dict] = {}
     if manifest_file.exists():
         try:
@@ -379,7 +468,7 @@ def sync_nested_top_rated(
     for src in stale_srcs:
         old_rel = manifest[src].get("rel_path")
         if old_rel:
-            stale_file = dir_music / old_rel
+            stale_file = dir_root / old_rel
             if stale_file.exists() and not dry_run:
                 try:
                     stale_file.unlink()
@@ -393,8 +482,8 @@ def sync_nested_top_rated(
     # 2. Planning
     copied = moved = stripped = 0
     move_plan: list[tuple[Path, Path, Path]] = []
-    copy_plan: list[tuple[Path, Path, str, str, float]] = []
-    strip_plan: list[tuple[Path, str, float, str, int]] = []
+    copy_plan: list[tuple[Path, Path, str, str, float, int, str]] = []
+    strip_plan: list[tuple[Path, str, float, str, int, str]] = []
 
     print()
     for rank, src in enumerate(master_tracks, 1):
@@ -402,7 +491,7 @@ def sync_nested_top_rated(
 
         src_str = str(src.resolve())
         is_top = src.resolve() in top_rated_tracks
-        target_folder = dir_top if is_top else dir_music
+        target_folder = dir_top if is_top else dir_root
         clean_title = get_clean_title(src)
         filename = f"{rank:04d}. {sanitize_filename(clean_title)}{src.suffix}"
         target_path = target_folder / filename
@@ -417,16 +506,18 @@ def sync_nested_top_rated(
 
         if prev:
             prev_rel = prev.get("rel_path")
-            prev_path = dir_music / prev_rel if prev_rel else None
+            prev_path = dir_root / prev_rel if prev_rel else None
 
             if prev_path and prev_path.exists():
                 if prev_rel != rel_path:
-                    tmp_path = dir_music / f"_tmp_{rank:04d}_{src.suffix}"
+                    tmp_path = dir_root / f"_tmp_{rank:04d}_{src.suffix}"
                     move_plan.append((prev_path, tmp_path, target_path))
                     moved += 1
 
                 if not keep_cover_art and (force_strip or has_cover_art(prev_path)):
-                    strip_plan.append((target_path, src_str, src_mtime, rel_path, rank))
+                    strip_plan.append(
+                        (target_path, src_str, src_mtime, rel_path, rank, clean_title)
+                    )
                     stripped += 1
                 else:
                     manifest[src_str] = {
@@ -436,12 +527,16 @@ def sync_nested_top_rated(
                         "mtime": src_mtime,
                     }
             else:
-                copy_plan.append((src, target_path, rel_path, src_str, src_mtime))
+                copy_plan.append(
+                    (src, target_path, rel_path, src_str, src_mtime, rank, clean_title)
+                )
                 copied += 1
         else:
             if target_path.exists() and target_path.stat().st_size > 0:
                 if not keep_cover_art and (force_strip or has_cover_art(target_path)):
-                    strip_plan.append((target_path, src_str, src_mtime, rel_path, rank))
+                    strip_plan.append(
+                        (target_path, src_str, src_mtime, rel_path, rank, clean_title)
+                    )
                     stripped += 1
                 else:
                     manifest[src_str] = {
@@ -451,7 +546,9 @@ def sync_nested_top_rated(
                         "mtime": src_mtime,
                     }
             else:
-                copy_plan.append((src, target_path, rel_path, src_str, src_mtime))
+                copy_plan.append(
+                    (src, target_path, rel_path, src_str, src_mtime, rank, clean_title)
+                )
                 copied += 1
 
     print(f"Plan: {copied} to copy, {moved} to move/rename, {stripped} art strips.")
@@ -491,9 +588,15 @@ def sync_nested_top_rated(
 
         with tempfile.TemporaryDirectory(prefix="echonano_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
-            for idx, (src, dst, rel_path, src_str, src_mtime) in enumerate(
-                copy_plan, 1
-            ):
+            for idx, (
+                src,
+                dst,
+                rel_path,
+                src_str,
+                src_mtime,
+                rank,
+                clean_title,
+            ) in enumerate(copy_plan, 1):
                 try:
                     copy_file(src, dst, tmp_dir, strip_art=not keep_cover_art)
                 except OSError as exc:
@@ -531,9 +634,14 @@ def sync_nested_top_rated(
     # Pass D: Strip art on existing files
     if strip_plan:
         total_strips = len(strip_plan)
-        for idx, (target_path, src_str, src_mtime, rel_path, rank) in enumerate(
-            strip_plan, 1
-        ):
+        for idx, (
+            target_path,
+            src_str,
+            src_mtime,
+            rel_path,
+            rank,
+            clean_title,
+        ) in enumerate(strip_plan, 1):
             if target_path.exists():
                 try:
                     remove_cover_art_from_file(target_path)
@@ -552,21 +660,17 @@ def sync_nested_top_rated(
                 save_manifest(manifest_file, manifest)
             render_progress_bar(idx, total_strips, prefix="Stripping art")
 
-    clean_junk_files(dir_music)
+    clean_junk_files(dir_root)
     save_manifest(manifest_file, manifest)
 
     print("\nFlushing filesystem write buffers to SD card...")
     os.sync()
 
     print(f"Sync complete: {len(manifest)} tracks active on card.")
+    sort_card(dest_root)
     send_notification(
         "Echo Nano Sync", f"Sync complete: {len(manifest)} tracks active."
     )
-
-    if auto_eject:
-        print("Safely unmounting card...")
-        subprocess.run(["udisksctl", "unmount", "-p", str(dest_root)], check=False)
-        print("Card unmounted cleanly. Safe to remove.")
 
 
 def main() -> int:
@@ -594,11 +698,6 @@ def main() -> int:
         "--force-strip",
         action="store_true",
         help="force re-strip art on all files in-place",
-    )
-    ap.add_argument(
-        "--eject-after",
-        action="store_true",
-        help="safely unmount card via udisksctl on completion",
     )
     ap.add_argument(
         "--master-playlist",
@@ -653,6 +752,9 @@ def main() -> int:
     top_rated_list = parse_fplite(profile, index, args.top_rated_playlist, source_root)
     top_rated_set = set(top_rated_list)
 
+    if not args.dry_run:
+        cache_sudo_credentials()
+
     sync_nested_top_rated(
         dest_root,
         master_tracks,
@@ -660,7 +762,6 @@ def main() -> int:
         args.dry_run,
         force_strip=args.force_strip,
         keep_cover_art=args.keep_cover_art,
-        auto_eject=args.eject_after,
     )
     return 0
 

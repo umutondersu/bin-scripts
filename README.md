@@ -62,18 +62,18 @@ foobar2000 ~/Music/*.mp3
 
 ### 🎶 echo-nano-sync
 
-Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP using a nested-directory layout.
+Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP using a flat card-root layout.
 
-The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. This script organizes tracks into a nested directory layout so curated favorites can be accessed via folder navigation while keeping full-library chronological playback intact without duplicating files.
+The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. Its File Browser sorts files by raw directory-entry order (not by filename), so this script renumbers tracks with zero-padded rank prefixes and then runs `fatsort` to physically reorder the card's directory entries — giving correct playback order without rewriting any audio data.
 
 **Architecture & How It Works:**
 
-* **Favorites Direct Access (`Storage > TF Card > Music > <Favorites>`):** Favorite tracks are placed into `/Music/<Favorite Playlist>/` for 1-click folder browsing.
-* **Full Library Order (`Category > All Songs`):** Recursively indexes `/Music/`, sorting the entire collection by zero-padded filename rank (`0001.`, `0002.`, …) in foobar2000 playlist order.
+* **Favorites Direct Access (`Storage > TF Card > Top Rated`):** Favorite tracks are placed into `/Top Rated/` at the card root for 1-click folder browsing.
+* **Full Library Order (File Browser at card root):** Non-favorite tracks live at the card root, named `0001.`, `0002.`, … in foobar2000 playlist order. A `fatsort -n` pass reorders the FAT directory entries so the Nano's File Browser (which sorts by copy order) shows them in the correct sequence.
 * **Zero Duplicate Files:** Tracks exist as single physical files on disk to stay safely below the 8,192-file firmware indexing limit.
 * **Embedded Cover Art Stripping:** Automatically removes embedded images across FLAC, MP3, WAV, OGG, OPUS, and M4A to save flash storage (can be disabled with `--keep-cover-art`).
 * **Fully Idempotent & Incremental:** Inspects actual on-disk state and records progress to an on-card `.manifest_nested.json` manifest. Safe to cancel with `Ctrl+C` and resume anytime.
-* **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT dot-file cleanup (`.DS_Store`, `._*`), filesystem write-cache sync (`os.sync()`), and optional post-sync unmounting.
+* **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), filesystem write-cache sync (`os.sync()`), a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
 
 **Defaults** (auto-detected or overridden via CLI):
 
@@ -88,8 +88,7 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 **Usage:**
 
 ```bash
-echo-nano-sync                         # Incremental sync of library to auto-detected SD card
-echo-nano-sync --eject-after           # Sync and safely unmount the card with udisksctl on completion
+echo-nano-sync                         # Incremental sync + directory sort; leaves the card unmounted
 echo-nano-sync --keep-cover-art        # Preserve embedded album artwork in audio files
 echo-nano-sync --dry-run               # Preview plan (copies, moves, art strips) without writing
 echo-nano-sync --limit 20              # Sync only the first 20 tracks (useful for test runs)
@@ -102,7 +101,9 @@ echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
 
 * Python 3.9+ with `mutagen`
 * foobar2000 (Wine) with playlists saved in `.fplite` format
-* `udisksctl` (optional, for `--eject-after`)
+* `fatsort` (sorts FAT directory entries for correct Nano playback order)
+* `dosfstools` (provides `fsck.fat` for pre-sort filesystem repair)
+* `udisks2` (provides `udisksctl` for mounting/unmounting the card)
 * `libnotify` / `notify-send` (optional, for desktop notifications)
 
 
