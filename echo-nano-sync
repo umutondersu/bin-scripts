@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -38,6 +39,8 @@ DEFAULT_MASTER_PLAYLIST = "Library Sorted"
 DEFAULT_TOP_RATED_PLAYLIST = "Top Rated"
 
 GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
+
+SUDO_KEEPER_STOP = threading.Event()
 
 
 def format_eta(seconds: int) -> str:
@@ -382,6 +385,12 @@ def resolve_block_device(mountpoint: Path) -> str | None:
         return None
 
 
+def _sudo_keeper() -> None:
+    """Keep sudo credentials fresh so a long sync doesn't cause a second prompt."""
+    while not SUDO_KEEPER_STOP.wait(240):
+        subprocess.run(["sudo", "-n", "-v"], check=False)
+
+
 def sort_card(dest_root: Path) -> None:
     """Unmount, repair, and sort the card's directory entries; leave it unmounted."""
     dev = resolve_block_device(dest_root)
@@ -395,23 +404,35 @@ def sort_card(dest_root: Path) -> None:
         print("[Warning] 'sudo' not found; skipping directory sort.")
         return
 
+    SUDO_KEEPER_STOP.set()
+
+    # Validate/refresh sudo BEFORE unmounting so fsck/fatsort runs immediately
+    # after unmount with no password-prompt gap (the device can detach in that gap).
+    if subprocess.run(["sudo", "-n", "-v"], check=False).returncode != 0:
+        print("Sudo credentials expired; enter your password to finish the sort.")
+        if subprocess.run(["sudo", "-v"], check=False).returncode != 0:
+            print("[Warning] Sudo not authorized; skipping directory sort.")
+            return
+
     if shutil.which("fsck.fat"):
-        fsck_line = (
-            f"fsck.fat -a {dev}\n"
-            "rc=$?\n"
-            'if [ $rc -gt 1 ]; then echo "fsck failed (code $rc); skipping sort" >&2; exit $rc; fi\n'
+        # Capture fsck output; only surface it on a real error (exit > 1).
+        # Exit 0/1 (clean / dirty-bit auto-fixed) is silent, which avoids the
+        # harmless "boot sector and its backup differ" notice printed every run.
+        fsck_part = (
+            f"OUT=$(fsck.fat -a {dev} 2>&1)\n"
+            "RC=$?\n"
+            'if [ "$RC" -gt 1 ]; then printf "%s\\n" "$OUT"; echo "fsck failed (code $RC); skipping sort" >&2; exit "$RC"; fi\n'
         )
     else:
         print("[Warning] 'fsck.fat' not found; skipping filesystem check.")
-        fsck_line = ""
+        fsck_part = ""
 
     print("\nUnmounting card for directory sort...")
     if subprocess.run(["udisksctl", "unmount", "-b", dev], check=False).returncode != 0:
         print("[Warning] Failed to unmount card; skipping directory sort.")
         return
 
-    subprocess.run(["sudo", "-v"], check=False)
-    script = fsck_line + f"fatsort -n {dev}\n"
+    script = fsck_part + f"fatsort -n {dev}\n"
     print("Checking filesystem and sorting directory entries...")
     result = subprocess.run(["sudo", "sh", "-c", script], check=False)
     if result.returncode != 0:
@@ -421,12 +442,15 @@ def sort_card(dest_root: Path) -> None:
 
 
 def cache_sudo_credentials() -> None:
-    """Prompt for the sudo password once, up front, so later sort steps run silently."""
+    """Prompt for the sudo password once up front, then keep it fresh during the sync."""
     if not shutil.which("sudo") or not shutil.which("fatsort"):
         return
-    print("Requesting sudo for the directory-sort step (enter password once)...")
+    print("Requesting sudo for the directory-sort step")
     if subprocess.run(["sudo", "-v"], check=False).returncode != 0:
         print("[Warning] Could not cache sudo credentials; you may be prompted again.")
+        return
+    SUDO_KEEPER_STOP.clear()
+    threading.Thread(target=_sudo_keeper, daemon=True).start()
 
 
 def sync_nested_top_rated(
@@ -680,6 +704,7 @@ def main() -> int:
         lambda sig, frame: sys.exit("\nSync aborted by user (progress preserved)."),
     )
 
+    start_time = time.time()
     default_dest = find_default_dest()
 
     ap = argparse.ArgumentParser(description="Echo NANO Subdirectory Layout Sync")
@@ -763,6 +788,9 @@ def main() -> int:
         force_strip=args.force_strip,
         keep_cover_art=args.keep_cover_art,
     )
+
+    elapsed = int(time.time() - start_time)
+    print(f"\nTotal time: {format_eta(elapsed)}.")
     return 0
 
 
