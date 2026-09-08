@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""Auto-mount + auto-sync the Echo Nano SD card when the player is plugged in.
+
+Detects the Nano's SD card partition (udev ID_MODEL "NANO_SD"), mounts it via
+udisksctl if needed, verifies it is a synced library (has the manifest), and
+runs `echo-nano-sync --dest <mount>`. Output is echoed to the systemd journal
+and also appended to a plain log file so progress can be watched with
+`journalctl --user -u echo-nano-sync -f` or `tail -f ~/.local/state/echo-nano-sync.log`.
+After the sync (which unmounts the card) it waits for the player to be
+unplugged before allowing another sync.
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SYNC_CMD = str(Path.home() / "bin" / "echo-nano-sync")
+POLL_SECONDS = 2
+MANIFEST = ".manifest_nested.json"
+MOUNT_WAIT_TRIES = 30
+LOG_FILE = str(Path.home() / ".local" / "state" / "echo-nano-sync.log")
+
+
+def notify(title: str, msg: str) -> None:
+    subprocess.run(["notify-send", "-a", "Echo Sync", title, msg], check=False)
+
+
+def nano_sd_partition() -> str | None:
+    """Return the partition path (e.g. /dev/sdc1) that is the Nano's SD reader."""
+    try:
+        out = subprocess.run(
+            ["lsblk", "-nro", "PATH,FSTYPE,TYPE"],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
+    except Exception:
+        return None
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        path, fstype, typ = parts[0], parts[1], parts[2]
+        if typ != "part" or not fstype:
+            continue
+        try:
+            info = subprocess.run(
+                ["udevadm", "info", "--query=property", "--name=" + path],
+                capture_output=True,
+                text=True,
+                check=False,
+            ).stdout
+        except Exception:
+            continue
+        if any(p.startswith("ID_MODEL=NANO_SD") for p in info.splitlines()):
+            return path
+    return None
+
+
+def mountpoint_of(part: str) -> str | None:
+    out = subprocess.run(
+        ["findmnt", "-n", "-o", "TARGET", part],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return out or None
+
+
+def ensure_mounted(part: str) -> str | None:
+    """Return the mount point, mounting the partition first if needed."""
+    mp = mountpoint_of(part)
+    if not mp:
+        subprocess.run(
+            ["udisksctl", "mount", "-b", part],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    for _ in range(MOUNT_WAIT_TRIES):
+        mp = mountpoint_of(part)
+        if mp:
+            return mp
+        time.sleep(0.5)
+    return None
+
+
+def run_sync(mp: str) -> int:
+    """Run the sync, echoing its output to the journal and the log file."""
+    Path(LOG_FILE).parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_FILE, "a", encoding="utf-8") as log:
+        log.write(f"\n===== sync {time.strftime('%Y-%m-%d %H:%M:%S')} ({mp}) =====\n")
+        log.flush()
+        proc = subprocess.Popen(
+            [SYNC_CMD, "--dest", mp],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            log.write(line)
+            log.flush()
+        proc.wait()
+    return proc.returncode
+
+
+def main() -> None:
+    print(f"Watching for Echo Nano SD card (idProduct 3203 / NANO_SD)...", flush=True)
+    armed = True
+    while True:
+        part = nano_sd_partition()
+        if part is None:
+            armed = True
+        elif armed:
+            armed = False
+            print(f"Echo Nano SD card detected ({part}); mounting...", flush=True)
+            mp = ensure_mounted(part)
+            if not mp or not (Path(mp) / MANIFEST).exists():
+                msg = "Card detected but could not be mounted as a synced library."
+                notify("Echo Nano Sync", msg)
+                print(msg, flush=True)
+            else:
+                print(f"Mounted at {mp}; starting sync.", flush=True)
+                rc = run_sync(mp)
+                if rc != 0:
+                    notify("Echo Nano Sync", "Auto-sync failed. See the log.")
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

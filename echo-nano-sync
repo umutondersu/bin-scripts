@@ -22,7 +22,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from pathlib import Path
 
@@ -39,8 +38,6 @@ DEFAULT_MASTER_PLAYLIST = "Library Sorted"
 DEFAULT_TOP_RATED_PLAYLIST = "Top Rated"
 
 GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
-
-SUDO_KEEPER_STOP = threading.Event()
 
 
 def format_eta(seconds: int) -> str:
@@ -63,6 +60,17 @@ def render_progress_bar(
 ) -> None:
     """Render a terminal progress bar with percentage and optional stats."""
     if total <= 0:
+        return
+    if not sys.stdout.isatty():
+        # Headless (auto-sync): emit a concise line ~every 5% so it can be
+        # watched via the journal/log, instead of spamming per-track updates.
+        step = max(1, total // 20)
+        if current == total or current % step == 0:
+            pct = current / total * 100
+            count_str = f"{pct:>4.0f}% [{current}/{total}]"
+            extra_str = f" | {extra}" if extra else ""
+            sys.stdout.write(f"{prefix:<16} {count_str}{extra_str}\n")
+            sys.stdout.flush()
         return
     percent = current / total
     filled = int(length * percent)
@@ -385,10 +393,19 @@ def resolve_block_device(mountpoint: Path) -> str | None:
         return None
 
 
-def _sudo_keeper() -> None:
-    """Keep sudo credentials fresh so a long sync doesn't cause a second prompt."""
-    while not SUDO_KEEPER_STOP.wait(240):
-        subprocess.run(["sudo", "-n", "-v"], check=False)
+def _sudo(args: list[str], capture: bool = False) -> subprocess.CompletedProcess:
+    """Run a command under sudo.
+
+    Uses ``-n`` when there's no terminal (e.g. auto-sync from the watcher) so it
+    never hangs, relying on the scoped NOPASSWD rule for fsck.fat/fatsort. When a
+    terminal is present it may prompt, preserving manual use without NOPASSWD.
+    """
+    cmd = ["sudo", *args]
+    if not sys.stdin.isatty():
+        cmd = ["sudo", "-n", *args]
+    if capture:
+        return subprocess.run(cmd, capture_output=True, text=True, check=False)
+    return subprocess.run(cmd, check=False)
 
 
 def sort_card(dest_root: Path) -> None:
@@ -404,53 +421,32 @@ def sort_card(dest_root: Path) -> None:
         print("[Warning] 'sudo' not found; skipping directory sort.")
         return
 
-    SUDO_KEEPER_STOP.set()
-
-    # Validate/refresh sudo BEFORE unmounting so fsck/fatsort runs immediately
-    # after unmount with no password-prompt gap (the device can detach in that gap).
-    if subprocess.run(["sudo", "-n", "-v"], check=False).returncode != 0:
-        print("Sudo credentials expired; enter your password to finish the sort.")
-        if subprocess.run(["sudo", "-v"], check=False).returncode != 0:
-            print("[Warning] Sudo not authorized; skipping directory sort.")
-            return
-
-    if shutil.which("fsck.fat"):
-        # Capture fsck output; only surface it on a real error (exit > 1).
-        # Exit 0/1 (clean / dirty-bit auto-fixed) is silent, which avoids the
-        # harmless "boot sector and its backup differ" notice printed every run.
-        fsck_part = (
-            f"OUT=$(fsck.fat -a {dev} 2>&1)\n"
-            "RC=$?\n"
-            'if [ "$RC" -gt 1 ]; then printf "%s\\n" "$OUT"; echo "fsck failed (code $RC); skipping sort" >&2; exit "$RC"; fi\n'
-        )
-    else:
-        print("[Warning] 'fsck.fat' not found; skipping filesystem check.")
-        fsck_part = ""
-
     print("\nUnmounting card for directory sort...")
     if subprocess.run(["udisksctl", "unmount", "-b", dev], check=False).returncode != 0:
         print("[Warning] Failed to unmount card; skipping directory sort.")
         return
 
-    script = fsck_part + f"fatsort -n {dev}\n"
-    print("Checking filesystem and sorting directory entries...")
-    result = subprocess.run(["sudo", "sh", "-c", script], check=False)
+    if shutil.which("fsck.fat"):
+        # Capture fsck output; only surface it on a real error (exit > 1).
+        # Exit 0/1 (clean / dirty-bit auto-fixed) is silent, which avoids the
+        # harmless "boot sector and its backup differ" notice printed every run.
+        print("Checking filesystem...")
+        fsck = _sudo(["fsck.fat", "-a", dev], capture=True)
+        if "password is required" in (fsck.stderr or ""):
+            print("[Warning] fsck.fat needs a password and none is available headless; skipping sort.")
+            return
+        if fsck.returncode > 1:
+            sys.stdout.write(fsck.stdout or "")
+            sys.stderr.write(fsck.stderr or "")
+            print("[Warning] fsck reported errors; skipping directory sort.")
+            return
+
+    print("Sorting directory entries...")
+    result = _sudo(["fatsort", "-n", dev])
     if result.returncode != 0:
-        print("[Warning] Directory sort did not complete; card left unmounted.")
+        print("[Warning] fatsort did not complete; card left unmounted.")
         return
     print("Card sorted and left unmounted. Safe to remove.")
-
-
-def cache_sudo_credentials() -> None:
-    """Prompt for the sudo password once up front, then keep it fresh during the sync."""
-    if not shutil.which("sudo") or not shutil.which("fatsort"):
-        return
-    print("Requesting sudo for the directory-sort step")
-    if subprocess.run(["sudo", "-v"], check=False).returncode != 0:
-        print("[Warning] Could not cache sudo credentials; you may be prompted again.")
-        return
-    SUDO_KEEPER_STOP.clear()
-    threading.Thread(target=_sudo_keeper, daemon=True).start()
 
 
 def sync_nested_top_rated(
@@ -466,6 +462,11 @@ def sync_nested_top_rated(
     if total_master > MAX_TRACKS:
         sys.exit(
             f"[FATAL] Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
+        )
+
+    if not dry_run:
+        send_notification(
+            "Echo Nano Sync", f"Sync started: {total_master} tracks to the card."
         )
 
     dir_root = dest_root
@@ -776,9 +777,6 @@ def main() -> int:
 
     top_rated_list = parse_fplite(profile, index, args.top_rated_playlist, source_root)
     top_rated_set = set(top_rated_list)
-
-    if not args.dry_run:
-        cache_sudo_credentials()
 
     sync_nested_top_rated(
         dest_root,
