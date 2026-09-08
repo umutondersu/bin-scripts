@@ -62,7 +62,7 @@ foobar2000 ~/Music/*.mp3
 
 ### 🎶 echo-nano-sync
 
-Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP using a flat card-root layout.
+Synchronize a personal foobar2000 music library to a FiiO Snowsky Echo Nano DAP using a flat card-root layout, with fully automatic sync when the player is plugged in.
 
 The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-file hardware indexing ceiling. Its File Browser sorts files by raw directory-entry order (not by filename), so this script renumbers tracks with zero-padded rank prefixes and then runs `fatsort` to physically reorder the card's directory entries — giving correct playback order without rewriting any audio data.
 
@@ -72,8 +72,12 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 * **Full Library Order (File Browser at card root):** Non-favorite tracks live at the card root, named `0001.`, `0002.`, … in foobar2000 playlist order. A `fatsort -n` pass reorders the FAT directory entries so the Nano's File Browser (which sorts by copy order) shows them in the correct sequence.
 * **Zero Duplicate Files:** Tracks exist as single physical files on disk to stay safely below the 8,192-file firmware indexing limit.
 * **Embedded Cover Art Stripping:** Automatically removes embedded images across FLAC, MP3, WAV, OGG, OPUS, and M4A to save flash storage (can be disabled with `--keep-cover-art`).
-* **Fully Idempotent & Incremental:** Inspects actual on-disk state and records progress to an on-card `.manifest_nested.json` manifest. Safe to cancel with `Ctrl+C` and resume anytime.
-* **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), filesystem write-cache sync (`os.sync()`), a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
+* **Atomic, Crash-Safe Writes:** Every file is staged in a hidden `.sync_tmp` directory, fsynced, then atomically renamed into place — a real filename never holds a torn/partial write, so unplugging mid-sync can't corrupt existing tracks.
+* **Idempotent & Resumable:** State is recorded in an on-card `.manifest_nested.json` (per-track `rel_path`, `rank`, `title`, `mtime`, and on-card `size`). Re-running reconciles against actual on-disk state, validates sizes, and resumes where an interrupted run left off. `Ctrl+C` finishes the current file, saves progress, and exits cleanly; just run it again to continue.
+* **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), `os.sync()` barriers between phases and after `fatsort`, a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
+* **Notifications:** Desktop notifications on sync start and completion.
+
+**Automatic sync on plug-in:** A background watcher (`echo-nano-sync-watch`, documented below) runs the sync automatically whenever the player is plugged in.
 
 **Defaults** (auto-detected or overridden via CLI):
 
@@ -88,13 +92,16 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 **Usage:**
 
 ```bash
-echo-nano-sync                         # Incremental sync + directory sort; leaves the card unmounted
-echo-nano-sync --keep-cover-art        # Preserve embedded album artwork in audio files
-echo-nano-sync --dry-run               # Preview plan (copies, moves, art strips) without writing
-echo-nano-sync --limit 20              # Sync only the first 20 tracks (useful for test runs)
-echo-nano-sync --force-strip           # Force re-check and strip embedded art from all files on card
-echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
+echo-nano-sync                             # Manual incremental sync; leaves the card unmounted
+echo-nano-sync --keep-cover-art            # Preserve embedded album artwork in audio files
+echo-nano-sync --dry-run                   # Preview plan (copies, moves, art strips) without writing
+echo-nano-sync --limit 20                  # Sync only the first 20 tracks (useful for test runs)
+echo-nano-sync --force-strip               # Force re-check and strip embedded art from all files on card
+echo-nano-sync --dest /path/to/mount       # Specify a custom SD card mount path
 
+systemctl --user enable --now echo-nano-sync      # Auto-sync whenever the player is plugged in
+journalctl --user -u echo-nano-sync -f            # Watch a background sync live
+tail -f ~/.local/state/echo-nano-sync.log         # ...or its log file
 ```
 
 **Requirements:**
@@ -105,7 +112,44 @@ echo-nano-sync --dest /path/to/mount   # Specify a custom SD card mount path
 * `dosfstools` (provides `fsck.fat` for pre-sort filesystem repair)
 * `udisks2` (provides `udisksctl` for mounting/unmounting the card)
 * `libnotify` / `notify-send` (optional, for desktop notifications)
+* systemd (user session) for the auto-sync watcher
 
+
+---
+
+### 🔄 echo-nano-sync-watch
+
+Background watcher that automatically syncs the Echo Nano whenever the player is plugged in. Companion to `echo-nano-sync`.
+
+**How it works:**
+
+* Polls every 2 s for the Nano's SD card partition, identified by udev identity `ID_MODEL=NANO_SD` — this cleanly distinguishes the card from the player's internal `NANO` storage, and works even when the card isn't mounted.
+* On detection: ensures the card is mounted (`udisksctl mount` if needed), verifies it's a synced library (has `.manifest_nested.json`), then runs `echo-nano-sync --dest <mount>`.
+* After the sync finishes (it unmounts the card), the watcher waits for the player to be **unplugged** before it will sync again — so it runs once per plug-in rather than looping.
+* Sends a desktop notification if the card can't be mounted or the sync fails.
+
+**Logging:** the sync output is echoed live both to the systemd journal and appended to `~/.local/state/echo-nano-sync.log`:
+
+```bash
+journalctl --user -u echo-nano-sync -f          # live output from the service
+tail -f ~/.local/state/echo-nano-sync.log       # ...or the plain log file
+```
+
+**Running it as a service:**
+
+```bash
+systemctl --user enable --now echo-nano-sync     # start at login and run now
+systemctl --user status echo-nano-sync           # check it's watching
+systemctl --user disable --now echo-nano-sync    # stop auto-sync
+```
+
+The unit file (`echo-nano-sync.service`) lives in `~/.config/systemd/user/` (kept in dotfiles), starts the watcher at login, and restarts it on failure.
+
+**Prerequisites:**
+
+* `~/bin` cloned so both `echo-nano-sync` and `echo-nano-sync-watch` are present (the setup skips otherwise).
+* **Passwordless sudo** for just `fatsort` and `fsck.fat` — headless runs have no terminal to prompt at. Installed as `/etc/sudoers.d/echo-nano-sync` by the dotfiles desktop setup.
+* The same packages as `echo-nano-sync` (`udisks2`, `fatsort`, `dosfstools`, `libnotify`).
 
 ---
 

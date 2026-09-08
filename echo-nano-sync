@@ -39,6 +39,10 @@ DEFAULT_TOP_RATED_PLAYLIST = "Top Rated"
 
 GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
 
+# Set by the SIGINT handler; checked between files so Ctrl+C aborts cleanly at a
+# safe point instead of mid-write. Mutable list to avoid `global` in the handler.
+ABORT = [False]
+
 
 def format_eta(seconds: int) -> str:
     """Format seconds into HH:MM:SS or MM:SS."""
@@ -329,20 +333,45 @@ def remove_cover_art_from_file(file_path: Path) -> bool:
     return modified
 
 
-def copy_file(src: Path, dst: Path, tmp_dir: Path, strip_art: bool = True) -> None:
-    """Copy track to destination, optionally stripping art in local fast storage first."""
-    if not strip_art:
-        shutil.copyfile(src, dst)
-        return
+def _fsync(path: Path) -> None:
+    """Force file data to storage (durability before the atomic rename)."""
+    with open(path, "rb") as fh:
+        os.fsync(fh.fileno())
 
-    tmp_file = tmp_dir / f"proc_{dst.name}"
+
+def _file_size(path: Path) -> int | None:
     try:
-        shutil.copyfile(src, tmp_file)
-        remove_cover_art_from_file(tmp_file)
-        shutil.copyfile(tmp_file, dst)
-    finally:
-        if tmp_file.exists():
-            tmp_file.unlink()
+        return path.stat().st_size
+    except OSError:
+        return None
+
+
+def stage_to_local(src: Path, tmp_dir: Path, tag: str, strip_art: bool) -> Path:
+    """Copy src into a fast local temp, stripping art if requested; return the path."""
+    staged = tmp_dir / f"stage_{tag}"
+    shutil.copyfile(src, staged)
+    if strip_art:
+        remove_cover_art_from_file(staged)
+    return staged
+
+
+def place_on_card(staged: Path, final: Path, temp_path: Path) -> None:
+    """Atomically move staged content to `final` via a same-filesystem temp+rename.
+
+    Writes to a scratch temp on the card, fsyncs it, then renames it over the
+    destination. The destination name therefore only ever points at a complete
+    file -- an interrupted write leaves only a scratch temp, never a partial at
+    the real name.
+    """
+    shutil.copyfile(staged, temp_path)
+    _fsync(temp_path)
+    try:
+        if final.exists():
+            final.unlink()
+        os.replace(temp_path, final)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
@@ -446,6 +475,7 @@ def sort_card(dest_root: Path) -> None:
     if result.returncode != 0:
         print("[Warning] fatsort did not complete; card left unmounted.")
         return
+    os.sync()  # ensure the reordered directory entries are durable before unplug
     print("Card sorted and left unmounted. Safe to remove.")
 
 
@@ -503,15 +533,35 @@ def sync_nested_top_rated(
 
     if stale_srcs and not dry_run:
         save_manifest(manifest_file, manifest)
+        os.sync()
+
+    def _abort() -> None:
+        if ABORT[0]:
+            save_manifest(manifest_file, manifest)
+            os.sync()
+            print("\nSync aborted - progress saved; run again to resume.")
+            sys.exit(130)
 
     # 2. Planning
     copied = moved = stripped = 0
-    move_plan: list[tuple[Path, Path, Path]] = []
-    copy_plan: list[tuple[Path, Path, str, str, float, int, str]] = []
-    strip_plan: list[tuple[Path, str, float, str, int, str]] = []
+    move_plan: list[tuple] = []
+    copy_plan: list[tuple] = []
+    strip_plan: list[tuple] = []
+    discard: list[Path] = []
+
+    # On-card scratch dir for atomic writes (temp + rename). Wiped up front so a
+    # crashed run's leftover temps never accumulate, and a file at a real
+    # destination name is always complete.
+    work_dir = dir_root / ".sync_tmp"
+    if not dry_run:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        for leftover in dir_root.glob("_tmp_*"):
+            leftover.unlink(missing_ok=True)
 
     print()
     for rank, src in enumerate(master_tracks, 1):
+        _abort()
         render_progress_bar(rank, total_master, prefix="Planning")
 
         src_str = str(src.resolve())
@@ -528,57 +578,119 @@ def sync_nested_top_rated(
             src_mtime = 0.0
 
         prev = manifest.get(src_str)
+        prev_rel = prev.get("rel_path") if prev else None
+        prev_path = (dir_root / prev_rel) if prev_rel else None
+        prev_size = prev.get("size") if prev else None
 
-        if prev:
-            prev_rel = prev.get("rel_path")
-            prev_path = dir_root / prev_rel if prev_rel else None
+        def _entry(size: int | None) -> dict:
+            return {
+                "rel_path": rel_path,
+                "rank": rank,
+                "title": clean_title,
+                "mtime": src_mtime,
+                "size": size,
+            }
 
-            if prev_path and prev_path.exists():
-                if prev_rel != rel_path:
-                    tmp_path = dir_root / f"_tmp_{rank:04d}_{src.suffix}"
-                    move_plan.append((prev_path, tmp_path, target_path))
-                    moved += 1
-
-                if not keep_cover_art and (force_strip or has_cover_art(prev_path)):
-                    strip_plan.append(
-                        (target_path, src_str, src_mtime, rel_path, rank, clean_title)
-                    )
-                    stripped += 1
-                else:
-                    manifest[src_str] = {
-                        "rel_path": rel_path,
-                        "rank": rank,
-                        "title": clean_title,
-                        "mtime": src_mtime,
-                    }
+        def _adopt_at_target() -> None:
+            """Target holds this source's complete file - adopt or schedule strip."""
+            tsize = _file_size(target_path)
+            if not keep_cover_art and (force_strip or has_cover_art(target_path)):
+                strip_plan.append((target_path, src_str, src_mtime, rel_path, rank, clean_title))
+                stripped += 1
             else:
-                copy_plan.append(
-                    (src, target_path, rel_path, src_str, src_mtime, rank, clean_title)
-                )
-                copied += 1
-        else:
-            if target_path.exists() and target_path.stat().st_size > 0:
-                if not keep_cover_art and (force_strip or has_cover_art(target_path)):
-                    strip_plan.append(
-                        (target_path, src_str, src_mtime, rel_path, rank, clean_title)
-                    )
-                    stripped += 1
-                else:
-                    manifest[src_str] = {
-                        "rel_path": rel_path,
-                        "rank": rank,
-                        "title": clean_title,
-                        "mtime": src_mtime,
-                    }
+                manifest[src_str] = _entry(tsize)
+
+        prev_file = prev_path if (prev_path and prev_path.is_file()) else None
+
+        # Trust a file parked under its recorded name only if it still matches the
+        # recorded size (P5); a corrupt/truncated old copy is discarded and rebuilt.
+        prev_ok = (
+            prev_file is not None
+            and (prev_size is None or _file_size(prev_file) == prev_size)
+        )
+
+        if prev_ok:
+            if prev_rel == rel_path:
+                _adopt_at_target()  # file already at its final name
+                continue
+            # A valid file sits under its old name; rename it into place.
+            move_plan.append(
+                (src, src_str, prev_file, target_path, rel_path, rank, clean_title, src_mtime)
+            )
+            moved += 1
+            if not keep_cover_art and (force_strip or has_cover_art(prev_file)):
+                strip_plan.append((target_path, src_str, src_mtime, rel_path, rank, clean_title))
+                stripped += 1
             else:
-                copy_plan.append(
-                    (src, target_path, rel_path, src_str, src_mtime, rank, clean_title)
-                )
-                copied += 1
+                manifest[src_str] = _entry(_file_size(prev_file))
+            continue
+
+        # A corrupt parked file (if any) is superseded - remove it during execution.
+        if prev_file is not None and prev_path != target_path:
+            discard.append(prev_file)
+
+        # No valid copy under the old name. A file already at the target is this
+        # track's (atomic writes guarantee it is complete) - adopt if its size
+        # matches any known recording, otherwise rebuild it.
+        if target_path.is_file():
+            tsize = _file_size(target_path)
+            if prev_size is None or tsize == prev_size:
+                _adopt_at_target()
+                continue
+
+        copy_plan.append((src, target_path, rel_path, src_str, src_mtime, rank, clean_title))
+        copied += 1
 
     print(f"Plan: {copied} to copy, {moved} to move/rename, {stripped} art strips.")
 
-    if copy_plan and not dry_run:
+    if dry_run:
+        return
+
+    # Remove corrupt/superseded old files before placing fresh ones.
+    for p in discard:
+        p.unlink(missing_ok=True)
+
+    # ---- Moves: rename each old file into its (free) destination. Every rename is
+    # one atomic op into a currently-free name, so interrupting the pass leaves each
+    # file either at its old name (re-moved next run) or its new name (adopted next
+    # run) -- never stranded in a temp. True name collisions/cycles are re-copied.
+    if move_plan:
+        pending = list(move_plan)
+        executed = []
+        while True:
+            _abort()
+            progressed = False
+            for mv in list(pending):
+                _abort()
+                _src, _s, old, target, _r, _rk, _t, _m = mv
+                if not old.exists():
+                    pending.remove(mv); executed.append(mv); progressed = True
+                elif not target.exists():
+                    try:
+                        old.rename(target)
+                    except OSError as exc:
+                        sys.exit(f"\n\n[FATAL] Move failed: {exc}")
+                    pending.remove(mv); executed.append(mv); progressed = True
+            if not progressed:
+                break
+        for mv in pending:  # collision / cycle fallback: fresh atomic copy from source
+            src, _s, old, target, rel_path, rank, clean_title, src_mtime = mv
+            old.unlink(missing_ok=True)
+            copy_plan.append((src, target, rel_path, _s, src_mtime, rank, clean_title))
+        for mv in executed:
+            _src, src_str, _o, target, rel_path, rank, clean_title, src_mtime = mv
+            manifest[src_str] = {
+                "rel_path": rel_path,
+                "rank": rank,
+                "title": clean_title,
+                "mtime": src_mtime,
+                "size": _file_size(target),
+            }
+        save_manifest(manifest_file, manifest)
+        os.sync()
+
+    # ---- Copies: stage locally (art stripped there), then atomic temp+rename on card.
+    if copy_plan:
         total_copy_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
         free_bytes = shutil.disk_usage(dest_root).free
         if total_copy_bytes > free_bytes:
@@ -588,24 +700,6 @@ def sync_nested_top_rated(
                 f"\n[FATAL] Insufficient space: Need {req_mb:.1f} MB, but only {free_mb:.1f} MB available."
             )
 
-    if dry_run:
-        return
-
-    # Pass A & B: Moves
-    for old_p, tmp_p, final_p in move_plan:
-        try:
-            if old_p.exists():
-                old_p.rename(tmp_p)
-            if tmp_p.exists():
-                tmp_p.rename(final_p)
-        except OSError as exc:
-            sys.exit(f"\n\n[FATAL] Move failed: {exc}")
-
-    if move_plan:
-        save_manifest(manifest_file, manifest)
-
-    # Pass C: Copy with local buffer & batched manifest updates
-    if copy_plan:
         total_copies = len(copy_plan)
         total_bytes = sum(s.stat().st_size for s, *_ in copy_plan)
         transferred_bytes = 0
@@ -613,17 +707,13 @@ def sync_nested_top_rated(
 
         with tempfile.TemporaryDirectory(prefix="echonano_") as tmp_dir_str:
             tmp_dir = Path(tmp_dir_str)
-            for idx, (
-                src,
-                dst,
-                rel_path,
-                src_str,
-                src_mtime,
-                rank,
-                clean_title,
-            ) in enumerate(copy_plan, 1):
+            for idx, (src, dst, rel_path, src_str, src_mtime, rank, clean_title) in enumerate(copy_plan, 1):
+                _abort()
                 try:
-                    copy_file(src, dst, tmp_dir, strip_art=not keep_cover_art)
+                    staged = stage_to_local(
+                        src, tmp_dir, f"{rank:05d}{src.suffix}", strip_art=not keep_cover_art
+                    )
+                    place_on_card(staged, dst, work_dir / f"c{rank:05d}{src.suffix}")
                 except OSError as exc:
                     sys.exit(f"\n\n[FATAL] Error copying {src.name}: {exc}")
 
@@ -644,48 +734,49 @@ def sync_nested_top_rated(
                     "rank": rank,
                     "title": clean_title,
                     "mtime": src_mtime,
+                    "size": _file_size(dst),
                 }
-
                 if idx % 50 == 0 or idx == total_copies:
                     save_manifest(manifest_file, manifest)
-
                 render_progress_bar(
                     idx,
                     total_copies,
                     prefix="Copying tracks",
                     extra=f"{speed:>4.1f} MB/s | ETA {eta_str}",
                 )
+        os.sync()
 
-    # Pass D: Strip art on existing files
+    # ---- Strip art in place, atomically (rewrite through scratch + rename).
     if strip_plan:
         total_strips = len(strip_plan)
-        for idx, (
-            target_path,
-            src_str,
-            src_mtime,
-            rel_path,
-            rank,
-            clean_title,
-        ) in enumerate(strip_plan, 1):
-            if target_path.exists():
-                try:
-                    remove_cover_art_from_file(target_path)
-                except OSError as exc:
-                    sys.exit(
-                        f"\n\n[FATAL] Error stripping art from {target_path.name}: {exc}"
-                    )
-
-            manifest[src_str] = {
-                "rel_path": rel_path,
-                "rank": rank,
-                "title": clean_title,
-                "mtime": src_mtime,
-            }
-            if idx % 50 == 0 or idx == total_strips:
-                save_manifest(manifest_file, manifest)
-            render_progress_bar(idx, total_strips, prefix="Stripping art")
+        with tempfile.TemporaryDirectory(prefix="echonano_") as tmp_dir_str:
+            tmp_dir = Path(tmp_dir_str)
+            for idx, (target_path, src_str, src_mtime, rel_path, rank, clean_title) in enumerate(strip_plan, 1):
+                _abort()
+                if target_path.is_file():
+                    try:
+                        staged = stage_to_local(
+                            target_path, tmp_dir, f"s{rank:05d}{target_path.suffix}", strip_art=True
+                        )
+                        place_on_card(staged, target_path, work_dir / f"s{rank:05d}{target_path.suffix}")
+                    except OSError as exc:
+                        sys.exit(
+                            f"\n\n[FATAL] Error stripping art from {target_path.name}: {exc}"
+                        )
+                manifest[src_str] = {
+                    "rel_path": rel_path,
+                    "rank": rank,
+                    "title": clean_title,
+                    "mtime": src_mtime,
+                    "size": _file_size(target_path),
+                }
+                if idx % 50 == 0 or idx == total_strips:
+                    save_manifest(manifest_file, manifest)
+                render_progress_bar(idx, total_strips, prefix="Stripping art")
+        os.sync()
 
     clean_junk_files(dir_root)
+    shutil.rmtree(work_dir, ignore_errors=True)
     save_manifest(manifest_file, manifest)
 
     print("\nFlushing filesystem write buffers to SD card...")
@@ -698,13 +789,18 @@ def sync_nested_top_rated(
     )
 
 
+def _sigint_handler(sig: int, frame: object) -> None:
+    """First Ctrl+C requests a clean stop at the next file boundary; a second one quits."""
+    if ABORT[0]:
+        sys.exit(130)
+    ABORT[0] = True
+    sys.stdout.write("\nInterrupt received - finishing the current file, then stopping...\n")
+    sys.stdout.flush()
+
+
 def main() -> int:
     """CLI entrypoint."""
-    signal.signal(
-        signal.SIGINT,
-        lambda sig, frame: sys.exit("\nSync aborted by user (progress preserved)."),
-    )
-
+    signal.signal(signal.SIGINT, _sigint_handler)
     start_time = time.time()
     default_dest = find_default_dest()
 
