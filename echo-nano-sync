@@ -396,33 +396,29 @@ def save_manifest(manifest_file: Path, manifest: dict[str, dict]) -> None:
     """Atomically persist synchronization state to JSON manifest."""
     try:
         tmp_manifest = manifest_file.with_suffix(".tmp")
-        tmp_manifest.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        tmp_manifest.write_text(
+            json.dumps(manifest, separators=(",", ":")), encoding="utf-8"
+        )
         tmp_manifest.replace(manifest_file)
     except OSError as exc:
         sys.exit(f"\n\n[FATAL] Failed to save manifest: {exc}")
 
 
 def clean_junk_files(root: Path) -> None:
-    """Clean OS-generated metadata files/dirs from the removable drive."""
-    patterns = (
-        "._*",
-        ".DS_Store",
-        ".Spotlight-V100",
-        ".fseventsd",
-        ".Trashes",
-        ".Trash-*",
-        "Thumbs.db",
-        ".apdisk",
-    )
-    for pat in patterns:
-        for junk in list(root.rglob(pat)):
-            try:
-                if junk.is_dir():
-                    shutil.rmtree(junk)
-                else:
-                    junk.unlink(missing_ok=True)
-            except OSError:
-                pass
+    """Clean OS-generated metadata files/dirs from the removable drive (one walk)."""
+    junk_dirs = {".Spotlight-V100", ".fseventsd", ".Trashes"}
+    junk_files = {".DS_Store", "Thumbs.db", ".apdisk"}
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        for d in list(dirnames):
+            if d in junk_dirs or d.startswith(".Trash-"):
+                shutil.rmtree(Path(dirpath) / d, ignore_errors=True)
+                dirnames.remove(d)
+        for f in filenames:
+            if f in junk_files or f.startswith("._"):
+                try:
+                    (Path(dirpath) / f).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 def resolve_block_device(mountpoint: Path) -> str | None:
@@ -751,7 +747,22 @@ def sync_nested_top_rated(
     # file either at its old name (re-moved next run) or its new name (adopted next
     # run) -- never stranded in a temp. True name collisions/cycles are re-copied.
     if move_plan:
-        pending = list(move_plan)
+        # Dependency order: rename a file only once its target name is free by
+        # following the chain target -> move-with-that-old and emitting the chain
+        # reversed. Keeps the pass O(M) instead of O(M^2) for large shifts.
+        by_source = {mv[2]: mv for mv in move_plan}
+        ordered_moves: list[tuple] = []
+        seen: set = set()
+        for mv in move_plan:
+            chain = []
+            cur = mv
+            while cur is not None and cur[2] not in seen:
+                seen.add(cur[2])
+                chain.append(cur)
+                cur = by_source.get(cur[3])  # move whose old name == cur's target
+            ordered_moves.extend(reversed(chain))
+
+        pending = list(ordered_moves)
         executed = []
         while True:
             _abort()
@@ -817,10 +828,14 @@ def sync_nested_top_rated(
             ) in enumerate(copy_plan, 1):
                 _abort()
                 try:
-                    staged = stage_to_local(
-                        src, tmp_dir, f"{rank:05d}{src.suffix}", strip_art=not keep_cover_art
-                    )
-                    place_on_card(staged, dst, work_dir / f"c{rank:05d}{src.suffix}")
+                    if keep_cover_art:
+                        # No stripping needed: copy straight to the card (atomic).
+                        place_on_card(src, dst, work_dir / f"c{rank:05d}{src.suffix}")
+                    else:
+                        staged = stage_to_local(
+                            src, tmp_dir, f"{rank:05d}{src.suffix}", strip_art=True
+                        )
+                        place_on_card(staged, dst, work_dir / f"c{rank:05d}{src.suffix}")
                 except OSError as exc:
                     sys.exit(f"\n\n[FATAL] Error copying {src.name}: {exc}")
 
