@@ -77,7 +77,7 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 * **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), `os.sync()` barriers between phases and after `fatsort`, a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
 * **Notifications:** Desktop notifications on sync start and completion.
 * **Excluded tracks:** Anything in the foobar `Nano Excluded` playlist stays on the PC but is never synced to the card — a clean way to keep the card under the 8,192-file ceiling without touching your file hierarchy.
-* **Folder playlists:** Every other foobar playlist (e.g. `Relax`) automatically becomes a folder at the card root holding a **duplicate** copy of each member — so the same song can live in `/Top Rated/` *and* `/Relax/`. Scratch playlists are ignored via an internal blacklist, or any playlist can be skipped with `--ignore-playlist`. (Top Rated stays special: single copy, no duplication.)
+* **Folder playlists:** Every other foobar playlist (e.g. `Relax`) automatically becomes a folder at the card root holding a **duplicate** copy of each member — so the same song can live in `/Top Rated/` *and* `/Relax/`. Scratch playlists are ignored via an internal blacklist, or any playlist can be skipped with `--ignore-playlist`. (Top Rated stays special: single copy, no duplication.) Duplicates are *renamed* rather than re-copied when tracks are renumbered, so reordering stays cheap.
 
 **Automatic sync on plug-in:** A background watcher (`echo-nano-sync-watch`, documented below) runs the sync automatically whenever the player is plugged in.
 

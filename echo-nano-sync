@@ -580,6 +580,9 @@ def sync_nested_top_rated(
     copy_plan: list[tuple] = []
     strip_plan: list[tuple] = []
     discard: list[Path] = []
+    # Previous canonical basename per source (used to rename folder duplicates
+    # instead of re-copying them when a track is merely renumbered/renamed).
+    prev_names: dict[str, str] = {}
 
     # On-card scratch dir for atomic writes (temp + rename). Wiped up front so a
     # crashed run's leftover temps never accumulate, and a file at a real
@@ -613,6 +616,8 @@ def sync_nested_top_rated(
         prev_rel = prev.get("rel_path") if prev else None
         prev_path = (dir_root / prev_rel) if prev_rel else None
         prev_size = prev.get("size") if prev else None
+        if prev_rel:
+            prev_names[src_str] = Path(prev_rel).name
 
         def _entry(size: int | None) -> dict:
             return {
@@ -812,16 +817,28 @@ def sync_nested_top_rated(
                 render_progress_bar(idx, total_strips, prefix="Stripping art")
         os.sync()
 
-    # ---- Folder playlists: each folder must contain exactly one copy per member.
-    # A member's copy is a duplicate of its canonical file (same basename). Sweeping
-    # the folder keeps it in sync across membership changes, renames, and removals
-    # without needing to track extra paths in the manifest.
-    extra_added = extra_removed = extra_kept = 0
+    # ---- Folder playlists: each folder holds exactly one copy per member.
+    # Duplicates are derived from the canonical file (same basename). If a track was
+    # only renumbered/renamed, the existing duplicate is renamed to match (no I/O);
+    # genuine changes are re-copied. Stale files are then swept.
+    fcopied = frenamed = fremoved = fkept = 0
     if folder_members:
+        total_members = sum(len(m) for m in folder_members.values())
+        total_bytes = 0
+        for members in folder_members.values():
+            for src_str in members:
+                entry = manifest.get(src_str)
+                if entry:
+                    total_bytes += _file_size(dir_root / entry.get("rel_path", "")) or 0
+        idx = 0
+        transferred = 0
+        fstart = time.time()
+
         for folder in sorted(folder_members):
             fdir = dir_root / folder
-            want: dict[str, Path] = {}  # basename -> canonical source file
-            for src_str in folder_members[folder]:
+            members = folder_members[folder]
+            want: dict[str, Path] = {}
+            for src_str in members:
                 entry = manifest.get(src_str)
                 if not entry:
                     continue
@@ -829,37 +846,80 @@ def sync_nested_top_rated(
                 if canon.is_file():
                     want[canon.name] = canon
             fdir.mkdir(parents=True, exist_ok=True)
+
+            # Descending rank => uniform shifts always find a free rename target.
+            ordered = sorted(
+                members, key=lambda s: manifest.get(s, {}).get("rank", 0), reverse=True
+            )
+            for src_str in ordered:
+                idx += 1
+                entry = manifest.get(src_str)
+                if entry:
+                    canon = dir_root / entry.get("rel_path", "")
+                    if canon.is_file():
+                        desired = fdir / canon.name
+                        csize = _file_size(canon)
+                        if desired.is_file() and _file_size(desired) == csize:
+                            fkept += 1
+                        else:
+                            old_name = prev_names.get(src_str)
+                            old = (fdir / old_name) if old_name else None
+                            if (
+                                old is not None
+                                and old.is_file()
+                                and _file_size(old) == csize
+                                and not desired.exists()
+                            ):
+                                try:
+                                    old.rename(desired)
+                                except OSError as exc:
+                                    sys.exit(f"\n[FATAL] Failed to rename folder copy: {exc}")
+                                frenamed += 1
+                            else:
+                                temp_path = work_dir / f"e{canon.name[:40]}"
+                                try:
+                                    shutil.copyfile(canon, temp_path)
+                                    _fsync(temp_path)
+                                    if desired.exists():
+                                        desired.unlink()
+                                    os.replace(temp_path, desired)
+                                except OSError as exc:
+                                    temp_path.unlink(missing_ok=True)
+                                    sys.exit(
+                                        f"\n\n[FATAL] Error writing folder copy {desired.name}: {exc}"
+                                    )
+                                fcopied += 1
+                                transferred += csize or 0
+
+                elapsed = time.time() - fstart
+                speed = (transferred / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                eta_sec = (
+                    int((total_bytes - transferred) / (speed * 1024 * 1024))
+                    if speed > 0
+                    else 0
+                )
+                render_progress_bar(
+                    idx,
+                    total_members,
+                    prefix="Folder copies",
+                    extra=f"{speed:>4.1f} MB/s | ETA {format_eta(eta_sec)}",
+                )
+
             for p in list(fdir.iterdir()):
                 if p.is_file() and p.name not in want:
                     try:
                         p.unlink()
                     except OSError as exc:
                         sys.exit(f"\n[FATAL] Failed to delete {p.name}: {exc}")
-                    extra_removed += 1
-            for name, canon in want.items():
-                p = fdir / name
-                csize = _file_size(canon)
-                if p.is_file() and _file_size(p) == csize:
-                    extra_kept += 1
-                    continue
-                temp_path = work_dir / f"e{name[:40]}"
-                try:
-                    shutil.copyfile(canon, temp_path)
-                    _fsync(temp_path)
-                    if p.exists():
-                        p.unlink()
-                    os.replace(temp_path, p)
-                except OSError as exc:
-                    temp_path.unlink(missing_ok=True)
-                    sys.exit(f"\n\n[FATAL] Error writing folder copy {p.name}: {exc}")
-                extra_added += 1
+                    fremoved += 1
             if not any(fdir.iterdir()):
                 fdir.rmdir()  # tidy empty folders (e.g. playlist emptied/removed)
 
-        if extra_added or extra_removed:
-            save_manifest(manifest_file, manifest)
         os.sync()
-        print(f"Folder copies: {extra_added} added, {extra_removed} removed, {extra_kept} kept.")
+        print(
+            f"Folder copies: {fcopied} copied, {frenamed} renamed, "
+            f"{fremoved} removed, {fkept} kept."
+        )
 
     clean_junk_files(dir_root)
     shutil.rmtree(work_dir, ignore_errors=True)
