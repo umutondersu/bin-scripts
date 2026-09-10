@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Echo NANO Subdirectory Layout Sync.
 
-Synchronizes foobar2000 'Top Rated' and 'Library Sorted' playlists
-using a flat folder layout:
-- Curated favorite tracks are placed into /Top Rated/
-- Remaining library tracks are placed at the card root
+Synchronizes foobar2000 playlists to a FiiO Snowsky Echo Nano DAP using a
+flat card-root layout:
+- Tracks in 'Nano Excluded' are never synced (kept for the desktop only).
+- Top Rated members live once in /Top Rated/ (single relocated copy).
+- Other library tracks live at the card root.
+- Any further playlist (Relax, ...) becomes a folder at the root holding
+  duplicate copies of its members; membership is read from foobar each run.
 - Zero-padded track numbering, plus a fatsort pass, keeps playback order
   correct in the Nano's File Browser (which sorts by raw directory order).
 - Strips embedded cover art across common formats to optimize flash storage.
-- Tracks sync state atomically using on-card with a JSON manifest.
+- Tracks sync state atomically using an on-card JSON manifest.
 """
 
 from __future__ import annotations
@@ -36,6 +39,17 @@ DEFAULT_PROFILE = HOME / "foobar2000" / "profile"
 DEFAULT_SOURCE_ROOT = HOME / "Music" / "0Main"
 DEFAULT_MASTER_PLAYLIST = "Library Sorted"
 DEFAULT_TOP_RATED_PLAYLIST = "Top Rated"
+DEFAULT_EXCLUDE_PLAYLIST = "Nano Excluded"
+
+# Playlists that are never turned into device folders (scratch / internal lists).
+IGNORED_PLAYLISTS = {
+    "Library Selection",
+    "Library Playback",
+    "Filter Results",
+    "Whole Library",
+    "Recent",
+    "R Top Rated",
+}
 
 GLOBAL_FILE_INDEX: dict[str, list[Path]] | None = None
 
@@ -483,15 +497,29 @@ def sync_nested_top_rated(
     dest_root: Path,
     master_tracks: list[Path],
     top_rated_tracks: set[Path],
+    folder_members: dict[str, set[str]],
     dry_run: bool,
     force_strip: bool = False,
     keep_cover_art: bool = False,
 ) -> None:
-    """Plan and execute incremental synchronization to destination drive."""
+    """Plan and execute incremental synchronization to destination drive.
+
+    ``folder_members`` maps a card-folder name (at the card root) to the set of
+    resolved source paths that should also have a duplicate copy there.
+    """
     total_master = len(master_tracks)
     if total_master > MAX_TRACKS:
         sys.exit(
             f"[FATAL] Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
+        )
+
+    extra_count = sum(len(s) for s in folder_members.values())
+    if total_master + extra_count > MAX_TRACKS:
+        sys.exit(
+            f"[FATAL] Card would hold {total_master + extra_count} files "
+            f"(including {extra_count} playlist duplicates), exceeding the "
+            f"firmware limit of {MAX_TRACKS}. Exclude more tracks from "
+            f"'{DEFAULT_EXCLUDE_PLAYLIST}'."
         )
 
     if not dry_run:
@@ -518,12 +546,16 @@ def sync_nested_top_rated(
 
     current_master_set = {str(p.resolve()) for p in master_tracks}
 
-    # 1. Prune removed tracks
+    # 1. Prune removed/excluded tracks (canonical copy + every folder duplicate)
     stale_srcs = [src for src in manifest if src not in current_master_set]
     for src in stale_srcs:
-        old_rel = manifest[src].get("rel_path")
-        if old_rel:
-            stale_file = dir_root / old_rel
+        old_entry = manifest[src]
+        stale_paths: list[Path] = []
+        if old_entry.get("rel_path"):
+            stale_paths.append(dir_root / old_entry["rel_path"])
+        for ep in old_entry.get("extra_paths") or []:
+            stale_paths.append(dir_root / ep)
+        for stale_file in stale_paths:
             if stale_file.exists() and not dry_run:
                 try:
                     stale_file.unlink()
@@ -642,6 +674,11 @@ def sync_nested_top_rated(
         copied += 1
 
     print(f"Plan: {copied} to copy, {moved} to move/rename, {stripped} art strips.")
+    folder_detail = ", ".join(
+        f"/{n} ({len(m)})" for n, m in sorted(folder_members.items()) if m
+    )
+    if folder_detail:
+        print(f"Folder playlists ({extra_count} duplicate copies): {folder_detail}.")
 
     if dry_run:
         return
@@ -775,6 +812,55 @@ def sync_nested_top_rated(
                 render_progress_bar(idx, total_strips, prefix="Stripping art")
         os.sync()
 
+    # ---- Folder playlists: each folder must contain exactly one copy per member.
+    # A member's copy is a duplicate of its canonical file (same basename). Sweeping
+    # the folder keeps it in sync across membership changes, renames, and removals
+    # without needing to track extra paths in the manifest.
+    extra_added = extra_removed = extra_kept = 0
+    if folder_members:
+        for folder in sorted(folder_members):
+            fdir = dir_root / folder
+            want: dict[str, Path] = {}  # basename -> canonical source file
+            for src_str in folder_members[folder]:
+                entry = manifest.get(src_str)
+                if not entry:
+                    continue
+                canon = dir_root / entry.get("rel_path", "")
+                if canon.is_file():
+                    want[canon.name] = canon
+            fdir.mkdir(parents=True, exist_ok=True)
+            for p in list(fdir.iterdir()):
+                if p.is_file() and p.name not in want:
+                    try:
+                        p.unlink()
+                    except OSError as exc:
+                        sys.exit(f"\n[FATAL] Failed to delete {p.name}: {exc}")
+                    extra_removed += 1
+            for name, canon in want.items():
+                p = fdir / name
+                csize = _file_size(canon)
+                if p.is_file() and _file_size(p) == csize:
+                    extra_kept += 1
+                    continue
+                temp_path = work_dir / f"e{name[:40]}"
+                try:
+                    shutil.copyfile(canon, temp_path)
+                    _fsync(temp_path)
+                    if p.exists():
+                        p.unlink()
+                    os.replace(temp_path, p)
+                except OSError as exc:
+                    temp_path.unlink(missing_ok=True)
+                    sys.exit(f"\n\n[FATAL] Error writing folder copy {p.name}: {exc}")
+                extra_added += 1
+            if not any(fdir.iterdir()):
+                fdir.rmdir()  # tidy empty folders (e.g. playlist emptied/removed)
+
+        if extra_added or extra_removed:
+            save_manifest(manifest_file, manifest)
+        os.sync()
+        print(f"Folder copies: {extra_added} added, {extra_removed} removed, {extra_kept} kept.")
+
     clean_junk_files(dir_root)
     shutil.rmtree(work_dir, ignore_errors=True)
     save_manifest(manifest_file, manifest)
@@ -832,6 +918,18 @@ def main() -> int:
         help="favorites playlist name",
     )
     ap.add_argument(
+        "--exclude-playlist",
+        default=DEFAULT_EXCLUDE_PLAYLIST,
+        help="playlist whose tracks are never synced to the card",
+    )
+    ap.add_argument(
+        "--ignore-playlist",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="ignore this playlist (never a device folder); repeatable",
+    )
+    ap.add_argument(
         "--profile", default=str(DEFAULT_PROFILE), help="foobar2000 profile directory"
     )
     ap.add_argument(
@@ -861,23 +959,63 @@ def main() -> int:
     print(f"Target destination: {dest_root}")
     index = load_playlist_index(profile)
 
-    master_tracks = parse_fplite(profile, index, args.master_playlist, source_root)
-    if not master_tracks:
+    master_all = parse_fplite(profile, index, args.master_playlist, source_root)
+    if not master_all:
         sys.exit(
             f"[FATAL] No tracks found in master playlist '{args.master_playlist}'. Aborting."
         )
+
+    # Tracks in the exclude playlist stay in foobar but never reach the card.
+    excluded = {
+        str(p.resolve())
+        for p in parse_fplite(profile, index, args.exclude_playlist, source_root)
+    }
+    master_tracks = [t for t in master_all if str(t.resolve()) not in excluded]
+    if not master_tracks:
+        sys.exit("[FATAL] Master playlist is empty after applying exclusions. Aborting.")
+    if excluded:
+        print(f"Excluded {len(excluded)} track(s) from the card ('{args.exclude_playlist}').")
 
     if args.limit:
         print(f"[Test Mode] Limiting master playlist to first {args.limit} tracks.")
         master_tracks = master_tracks[: args.limit]
 
-    top_rated_list = parse_fplite(profile, index, args.top_rated_playlist, source_root)
-    top_rated_set = set(top_rated_list)
+    master_set = {str(t.resolve()) for t in master_tracks}
+
+    top_rated_set = {
+        p.resolve()
+        for p in parse_fplite(profile, index, args.top_rated_playlist, source_root)
+        if str(p.resolve()) in master_set
+    }
+
+    # Folder playlists: every playlist except master / Top Rated / the exclude
+    # list / the blacklist. Members get duplicate copies on the card.
+    ignored = set(IGNORED_PLAYLISTS) | set(args.ignore_playlist)
+    specials = {
+        args.master_playlist.lower(),
+        args.top_rated_playlist.lower(),
+        args.exclude_playlist.lower(),
+    }
+    folder_members: dict[str, set[str]] = {}
+    for name in set(index.values()):
+        if name.lower() in specials or name in ignored:
+            continue
+        folder_name = sanitize_filename(name)
+        if not folder_name:
+            continue
+        members = {
+            str(p.resolve())
+            for p in parse_fplite(profile, index, name, source_root)
+            if str(p.resolve()) in master_set
+        }
+        # Keep the folder even if currently empty so stale copies get swept out.
+        folder_members[folder_name] = members
 
     sync_nested_top_rated(
         dest_root,
         master_tracks,
         top_rated_set,
+        folder_members,
         args.dry_run,
         force_strip=args.force_strip,
         keep_cover_art=args.keep_cover_art,

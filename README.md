@@ -76,6 +76,8 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 * **Idempotent & Resumable:** State is recorded in an on-card `.manifest_nested.json` (per-track `rel_path`, `rank`, `title`, `mtime`, and on-card `size`). Re-running reconciles against actual on-disk state, validates sizes, and resumes where an interrupted run left off. `Ctrl+C` finishes the current file, saves progress, and exits cleanly; just run it again to continue.
 * **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), `os.sync()` barriers between phases and after `fatsort`, a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
 * **Notifications:** Desktop notifications on sync start and completion.
+* **Excluded tracks:** Anything in the foobar `Nano Excluded` playlist stays on the PC but is never synced to the card — a clean way to keep the card under the 8,192-file ceiling without touching your file hierarchy.
+* **Folder playlists:** Every other foobar playlist (e.g. `Relax`) automatically becomes a folder at the card root holding a **duplicate** copy of each member — so the same song can live in `/Top Rated/` *and* `/Relax/`. Scratch playlists are ignored via an internal blacklist, or any playlist can be skipped with `--ignore-playlist`. (Top Rated stays special: single copy, no duplication.)
 
 **Automatic sync on plug-in:** A background watcher (`echo-nano-sync-watch`, documented below) runs the sync automatically whenever the player is plugged in.
 
@@ -98,6 +100,8 @@ echo-nano-sync --dry-run                   # Preview plan (copies, moves, art st
 echo-nano-sync --limit 20                  # Sync only the first 20 tracks (useful for test runs)
 echo-nano-sync --force-strip               # Force re-check and strip embedded art from all files on card
 echo-nano-sync --dest /path/to/mount       # Specify a custom SD card mount path
+echo-nano-sync --exclude-playlist "Nano Excluded"   # never sync this foobar playlist
+echo-nano-sync --ignore-playlist "Workout"          # don't turn a playlist into a folder
 
 systemctl --user enable --now echo-nano-sync      # Auto-sync whenever the player is plugged in
 journalctl --user -u echo-nano-sync -f            # Watch a background sync live
