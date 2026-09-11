@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """Echo NANO Subdirectory Layout Sync.
 
-Synchronizes foobar2000 playlists to a FiiO Snowsky Echo Nano DAP using a
-flat card-root layout:
+Synchronizes foobar2000 playlists to a FiiO Snowsky Echo Nano DAP:
 - Tracks in 'Nano Excluded' are never synced (kept for the desktop only).
-- Top Rated members live once in /Top Rated/ (single relocated copy).
-- Other library tracks live at the card root.
-- Any further playlist (Relax, ...) becomes a folder at the root holding
-  duplicate copies of its members; membership is read from foobar each run.
+- Every other playlist (Top Rated, Relax, ...) becomes a folder at the card
+  root holding one copy per member; membership is read from foobar each run.
+- A track in several playlists gets one copy per folder (overlaps duplicate).
+- Tracks in no playlist live at the card root.
 - Zero-padded track numbering, plus a fatsort pass, keeps playback order
   correct in the Nano's File Browser (which sorts by raw directory order).
 - Strips embedded cover art across common formats to optimize flash storage.
@@ -496,7 +495,6 @@ def sort_card(dest_root: Path) -> None:
 def sync_nested_top_rated(
     dest_root: Path,
     master_tracks: list[Path],
-    top_rated_tracks: set[Path],
     folder_members: dict[str, set[str]],
     dry_run: bool,
     force_strip: bool = False,
@@ -504,22 +502,20 @@ def sync_nested_top_rated(
 ) -> None:
     """Plan and execute incremental synchronization to destination drive.
 
-    ``folder_members`` maps a card-folder name (at the card root) to the set of
-    resolved source paths that should also have a duplicate copy there.
+    Every non-master playlist is a folder holding one copy per member; a track in
+    several playlists gets a copy in each (overlaps duplicate). Tracks in no
+    playlist live at the card root. ``folder_members`` maps folder name -> set of
+    resolved source paths that belong to it.
     """
     total_master = len(master_tracks)
-    if total_master > MAX_TRACKS:
+    folder_union = set().union(*folder_members.values()) if folder_members else set()
+    folder_count = sum(len(m) for m in folder_members.values())
+    physical = (total_master - len(folder_union)) + folder_count
+    if physical > MAX_TRACKS:
         sys.exit(
-            f"[FATAL] Library has {total_master} tracks, exceeding firmware limit of {MAX_TRACKS}."
-        )
-
-    extra_count = sum(len(s) for s in folder_members.values())
-    if total_master + extra_count > MAX_TRACKS:
-        sys.exit(
-            f"[FATAL] Card would hold {total_master + extra_count} files "
-            f"(including {extra_count} playlist duplicates), exceeding the "
-            f"firmware limit of {MAX_TRACKS}. Exclude more tracks from "
-            f"'{DEFAULT_EXCLUDE_PLAYLIST}'."
+            f"[FATAL] Card would hold {physical} files (including {folder_count} "
+            f"playlist copies), exceeding the firmware limit of {MAX_TRACKS}. "
+            f"Exclude more tracks from '{DEFAULT_EXCLUDE_PLAYLIST}'."
         )
 
     if not dry_run:
@@ -528,13 +524,14 @@ def sync_nested_top_rated(
         )
 
     dir_root = dest_root
-    dir_top = dest_root / "Top Rated"
-
     if not dry_run:
-        try:
-            dir_top.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            sys.exit(f"[FATAL] Cannot create target directories: {exc}")
+        for name, members in folder_members.items():
+            if not members:
+                continue
+            try:
+                (dir_root / name).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                sys.exit(f"[FATAL] Cannot create target directory /{name}: {exc}")
 
     manifest_file = dir_root / ".manifest_nested.json"
     manifest: dict[str, dict] = {}
@@ -544,18 +541,30 @@ def sync_nested_top_rated(
         except Exception:
             manifest = {}
 
+    def _prev_paths(entry: dict | None) -> list[str]:
+        """All physical paths recorded for a track (new `paths` or legacy fields)."""
+        if not entry:
+            return []
+        if entry.get("paths"):
+            return list(entry["paths"])
+        out: list[str] = []
+        if entry.get("rel_path"):
+            out.append(entry["rel_path"])
+        for ep in entry.get("extra_paths") or []:
+            if ep not in out:
+                out.append(ep)
+        return out
+
+    def _folder_of(rel: str | None) -> str | None:
+        return rel.split("/", 1)[0] if rel and "/" in rel else None
+
     current_master_set = {str(p.resolve()) for p in master_tracks}
 
-    # 1. Prune removed/excluded tracks (canonical copy + every folder duplicate)
+    # 1. Prune removed/excluded tracks (every copy).
     stale_srcs = [src for src in manifest if src not in current_master_set]
     for src in stale_srcs:
-        old_entry = manifest[src]
-        stale_paths: list[Path] = []
-        if old_entry.get("rel_path"):
-            stale_paths.append(dir_root / old_entry["rel_path"])
-        for ep in old_entry.get("extra_paths") or []:
-            stale_paths.append(dir_root / ep)
-        for stale_file in stale_paths:
+        for rel in _prev_paths(manifest[src]):
+            stale_file = dir_root / rel
             if stale_file.exists() and not dry_run:
                 try:
                     stale_file.unlink()
@@ -580,14 +589,9 @@ def sync_nested_top_rated(
     copy_plan: list[tuple] = []
     strip_plan: list[tuple] = []
     discard: list[Path] = []
-    # Previous folder-duplicate paths per source, carried across the manifest
-    # rewrite so duplicates can be renamed (not re-copied) even after an
-    # interrupted run that renamed the canonical files first.
-    prev_extras_map: dict[str, list[str]] = {}
+    prev_paths_map: dict[str, list[str]] = {}
 
-    # On-card scratch dir for atomic writes (temp + rename). Wiped up front so a
-    # crashed run's leftover temps never accumulate, and a file at a real
-    # destination name is always complete.
+    # On-card scratch dir for atomic writes (temp + rename).
     work_dir = dir_root / ".sync_tmp"
     if not dry_run:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -601,9 +605,6 @@ def sync_nested_top_rated(
         render_progress_bar(rank, total_master, prefix="Planning")
 
         src_str = str(src.resolve())
-        is_top = src.resolve() in top_rated_tracks
-        target_folder = dir_top if is_top else dir_root
-
         try:
             st = src.stat()
             src_mtime = st.st_mtime
@@ -613,15 +614,13 @@ def sync_nested_top_rated(
             src_size = None
 
         prev = manifest.get(src_str)
+        prev_paths = _prev_paths(prev)
+        prev_paths_map[src_str] = prev_paths
         prev_rel = prev.get("rel_path") if prev else None
-        prev_path = (dir_root / prev_rel) if prev_rel else None
         prev_size = prev.get("size") if prev else None
         prev_art = prev.get("art") if prev else None
-        prev_extras = (prev.get("extra_paths") if prev else None) or []
-        prev_extras_map[src_str] = prev_extras
 
-        # Title cache: reuse the stored title when the source is unchanged (saves
-        # a tag read per track on every run).
+        # Title cache: reuse the stored title when the source is unchanged.
         if (
             prev
             and prev.get("v") == TITLE_CACHE_V
@@ -634,12 +633,44 @@ def sync_nested_top_rated(
             clean_title = get_clean_title(src)
 
         filename = f"{rank:04d}. {sanitize_filename(clean_title)}{src.suffix}"
-        target_path = target_folder / filename
-        rel_path = f"Top Rated/{filename}" if is_top else filename
+
+        # Destination folders (one copy each); root if none.
+        dests = sorted(f for f in folder_members if src_str in folder_members[f])
+        candidates = dests if dests else [None]
+        prev_by_folder: dict[str | None, str] = {}
+        for p in prev_paths:
+            prev_by_folder.setdefault(_folder_of(p), p)
+
+        primary: str | None = None
+        found = False
+        for c in candidates:
+            if c in prev_by_folder:
+                primary = c
+                found = True
+                break
+        if not found:
+            pf = _folder_of(prev_rel) if prev_rel else None
+            primary = pf if pf in candidates else candidates[0]
+
+        rel_path = f"{primary}/{filename}" if primary else filename
+        target_path = dir_root / rel_path
+
+        # A previous copy to reuse (prefer the primary folder, else any).
+        prev_file: Path | None = None
+        pref = prev_by_folder.get(primary)
+        if pref and (dir_root / pref).is_file():
+            prev_file = dir_root / pref
+        if prev_file is None:
+            for p in prev_paths:
+                cand = dir_root / p
+                if cand.is_file():
+                    prev_file = cand
+                    break
 
         def _entry(size: int | None, art: bool | None) -> dict:
             return {
                 "rel_path": rel_path,
+                "paths": [rel_path],
                 "rank": rank,
                 "title": clean_title,
                 "mtime": src_mtime,
@@ -647,23 +678,20 @@ def sync_nested_top_rated(
                 "art": art,
                 "src_size": src_size,
                 "v": TITLE_CACHE_V,
-                "extra_paths": list(prev_extras),
             }
 
         def _cached_art(path: Path) -> bool | None:
-            """Art presence if we can trust the cache (file size unchanged), else None."""
             if prev_art is not None and prev_size == _file_size(path):
                 return prev_art
             return None
 
         def _adopt_at_target() -> None:
-            """Target holds this source's complete file - adopt or schedule strip."""
             tsize = _file_size(target_path)
             art = _cached_art(target_path)
             do_strip = force_strip
             if not do_strip and not keep_cover_art:
                 if art is None:
-                    art = has_cover_art(target_path)  # probe once, then cache
+                    art = has_cover_art(target_path)
                 do_strip = art
             if do_strip:
                 strip_plan.append(
@@ -673,25 +701,20 @@ def sync_nested_top_rated(
             else:
                 manifest[src_str] = _entry(tsize, art)
 
-        prev_file = prev_path if (prev_path and prev_path.is_file()) else None
-
-        # Trust a file parked under its recorded name only if it still matches the
-        # recorded size; a corrupt/truncated old copy is discarded and rebuilt.
-        prev_ok = (
-            prev_file is not None
-            and (prev_size is None or _file_size(prev_file) == prev_size)
+        prev_ok = prev_file is not None and (
+            prev_size is None or _file_size(prev_file) == prev_size
         )
 
         if prev_ok:
-            if prev_rel == rel_path:
-                _adopt_at_target()  # file already at its final name
+            if prev_file == target_path:
+                _adopt_at_target()
                 continue
             fsize = _file_size(prev_file)
             art = _cached_art(prev_file)
             do_strip = force_strip
             if not do_strip and not keep_cover_art:
                 if art is None:
-                    art = has_cover_art(prev_file)  # probe once, then cache
+                    art = has_cover_art(prev_file)
                 do_strip = art
             if do_strip:
                 strip_plan.append(
@@ -700,7 +723,6 @@ def sync_nested_top_rated(
                 stripped += 1
             else:
                 manifest[src_str] = _entry(fsize, art)
-            # A valid file sits under its old name; rename it into place.
             move_plan.append(
                 (
                     src, src_str, prev_file, target_path, rel_path, rank,
@@ -710,13 +732,10 @@ def sync_nested_top_rated(
             moved += 1
             continue
 
-        # A corrupt parked file (if any) is superseded - remove it during execution.
-        if prev_file is not None and prev_path != target_path:
+        # Corrupt/superseded parked copy: drop it during execution.
+        if prev_file is not None and prev_file != target_path:
             discard.append(prev_file)
 
-        # No valid copy under the old name. A file already at the target is this
-        # track's (atomic writes guarantee it is complete) - adopt if its size
-        # matches any known recording, otherwise rebuild it.
         if target_path.is_file():
             tsize = _file_size(target_path)
             if prev_size is None or tsize == prev_size:
@@ -733,23 +752,17 @@ def sync_nested_top_rated(
         f"/{n} ({len(m)})" for n, m in sorted(folder_members.items()) if m
     )
     if folder_detail:
-        print(f"Folder playlists ({extra_count} duplicate copies): {folder_detail}.")
+        print(f"Folders ({folder_count} copies): {folder_detail}.")
+    print(f"Card files: {physical} (root {total_master - len(folder_union)} + folders {folder_count}).")
 
     if dry_run:
         return
 
-    # Remove corrupt/superseded old files before placing fresh ones.
     for p in discard:
         p.unlink(missing_ok=True)
 
-    # ---- Moves: rename each old file into its (free) destination. Every rename is
-    # one atomic op into a currently-free name, so interrupting the pass leaves each
-    # file either at its old name (re-moved next run) or its new name (adopted next
-    # run) -- never stranded in a temp. True name collisions/cycles are re-copied.
+    # ---- Moves: dependency-ordered single renames (O(M)).
     if move_plan:
-        # Dependency order: rename a file only once its target name is free by
-        # following the chain target -> move-with-that-old and emitting the chain
-        # reversed. Keeps the pass O(M) instead of O(M^2) for large shifts.
         by_source = {mv[2]: mv for mv in move_plan}
         ordered_moves: list[tuple] = []
         seen: set = set()
@@ -759,7 +772,7 @@ def sync_nested_top_rated(
             while cur is not None and cur[2] not in seen:
                 seen.add(cur[2])
                 chain.append(cur)
-                cur = by_source.get(cur[3])  # move whose old name == cur's target
+                cur = by_source.get(cur[3])
             ordered_moves.extend(reversed(chain))
 
         pending = list(ordered_moves)
@@ -769,7 +782,7 @@ def sync_nested_top_rated(
             progressed = False
             for mv in list(pending):
                 _abort()
-                _src, _s, old, target = mv[0], mv[1], mv[2], mv[3]
+                old, target = mv[2], mv[3]
                 if not old.exists():
                     pending.remove(mv); executed.append(mv); progressed = True
                 elif not target.exists():
@@ -793,6 +806,7 @@ def sync_nested_top_rated(
             ) = mv
             manifest[src_str] = {
                 "rel_path": rel_path,
+                "paths": [rel_path],
                 "rank": rank,
                 "title": clean_title,
                 "mtime": src_mtime,
@@ -800,7 +814,6 @@ def sync_nested_top_rated(
                 "art": art,
                 "src_size": src_size,
                 "v": TITLE_CACHE_V,
-                "extra_paths": prev_extras_map.get(src_str, []),
             }
         save_manifest(manifest_file, manifest)
         os.sync()
@@ -829,7 +842,6 @@ def sync_nested_top_rated(
                 _abort()
                 try:
                     if keep_cover_art:
-                        # No stripping needed: copy straight to the card (atomic).
                         place_on_card(src, dst, work_dir / f"c{rank:05d}{src.suffix}")
                     else:
                         staged = stage_to_local(
@@ -853,6 +865,7 @@ def sync_nested_top_rated(
 
                 manifest[src_str] = {
                     "rel_path": rel_path,
+                    "paths": [rel_path],
                     "rank": rank,
                     "title": clean_title,
                     "mtime": src_mtime,
@@ -860,7 +873,6 @@ def sync_nested_top_rated(
                     "art": False if not keep_cover_art else None,
                     "src_size": src_size,
                     "v": TITLE_CACHE_V,
-                    "extra_paths": prev_extras_map.get(src_str, []),
                 }
                 if idx % 50 == 0 or idx == total_copies:
                     save_manifest(manifest_file, manifest)
@@ -893,6 +905,7 @@ def sync_nested_top_rated(
                         )
                 manifest[src_str] = {
                     "rel_path": rel_path,
+                    "paths": [rel_path],
                     "rank": rank,
                     "title": clean_title,
                     "mtime": src_mtime,
@@ -900,29 +913,25 @@ def sync_nested_top_rated(
                     "art": False,
                     "src_size": src_size,
                     "v": TITLE_CACHE_V,
-                    "extra_paths": prev_extras_map.get(src_str, []),
                 }
                 if idx % 50 == 0 or idx == total_strips:
                     save_manifest(manifest_file, manifest)
                 render_progress_bar(idx, total_strips, prefix="Stripping art")
         os.sync()
 
-    # ---- Folder playlists: each folder holds exactly one copy per member.
-    # Duplicates are derived from the canonical file (same basename). When a track
-    # was only renumbered/renamed the existing duplicate is renamed to match (no
-    # I/O) -- located via the carried extra_paths, or a content signature as a
-    # fallback. Genuine changes are re-copied. Stale files are then swept.
+    # ---- Folder copies: each folder holds one copy per member. Copies are derived
+    # from the track's primary file; existing copies are renamed when only the rank
+    # changed. Overlaps (track in several playlists) yield several copies.
     fcopied = frenamed = fremoved = fkept = 0
     if folder_members:
-        # Previous duplicate name per (source, folder), from the carried extras.
-        old_extra: dict[str, dict[str, str]] = {}
-        for _s, _eps in prev_extras_map.items():
-            for ep in _eps:
-                pp = Path(ep)
-                old_extra.setdefault(_s, {})[pp.parent.name] = pp.name
+        old_path_by_folder: dict[str, dict[str, str]] = {}
+        for _s, _paths in prev_paths_map.items():
+            for p in _paths:
+                fld = _folder_of(p)
+                if fld is not None:
+                    old_path_by_folder.setdefault(_s, {})[fld] = p
 
         def _sig(path: Path) -> tuple | None:
-            """Cheap content fingerprint (size + first 128 KiB) for exact matching."""
             try:
                 with open(path, "rb") as fh:
                     head = fh.read(131072)
@@ -930,7 +939,7 @@ def sync_nested_top_rated(
             except OSError:
                 return None
 
-        total_members = sum(len(m) for m in folder_members.values())
+        total_members = folder_count
         total_bytes = 0
         for members in folder_members.values():
             for src_str in members:
@@ -940,7 +949,7 @@ def sync_nested_top_rated(
         idx = 0
         transferred = 0
         fstart = time.time()
-        new_extras: dict[str, list[str]] = {}
+        new_paths: dict[str, list[str]] = {}
 
         for folder in sorted(folder_members):
             fdir = dir_root / folder
@@ -954,13 +963,11 @@ def sync_nested_top_rated(
                 if canon.is_file():
                     want[canon.name] = canon
             fdir.mkdir(parents=True, exist_ok=True)
-            # Existing files not already a desired name = rename candidates.
             available = {
                 p.name: p for p in fdir.iterdir() if p.is_file() and p.name not in want
             }
             cand_sig: dict | None = None
 
-            # Descending rank => uniform shifts always find a free rename target.
             ordered = sorted(
                 members, key=lambda s: manifest.get(s, {}).get("rank", 0), reverse=True
             )
@@ -972,26 +979,26 @@ def sync_nested_top_rated(
                     if canon.is_file():
                         desired = fdir / canon.name
                         csize = _file_size(canon)
-                        new_extras.setdefault(src_str, []).append(f"{folder}/{canon.name}")
+                        new_paths.setdefault(src_str, []).append(f"{folder}/{canon.name}")
                         if desired.is_file() and _file_size(desired) == csize:
                             fkept += 1
                         else:
                             renamed = False
-                            # 1) exact carried duplicate name
-                            old_name = old_extra.get(src_str, {}).get(folder)
-                            if (
-                                old_name in available
-                                and _file_size(available[old_name]) == csize
-                                and not desired.exists()
-                            ):
-                                try:
-                                    available[old_name].rename(desired)
-                                except OSError as exc:
-                                    sys.exit(f"\n[FATAL] Failed to rename folder copy: {exc}")
-                                del available[old_name]
-                                frenamed += 1
-                                renamed = True
-                            # 2) content-signature fallback (handles an interrupted run)
+                            old_rel = old_path_by_folder.get(src_str, {}).get(folder)
+                            if old_rel:
+                                old_name = Path(old_rel).name
+                                if (
+                                    old_name in available
+                                    and _file_size(available[old_name]) == csize
+                                    and not desired.exists()
+                                ):
+                                    try:
+                                        available[old_name].rename(desired)
+                                    except OSError as exc:
+                                        sys.exit(f"\n[FATAL] Failed to rename folder copy: {exc}")
+                                    del available[old_name]
+                                    frenamed += 1
+                                    renamed = True
                             if not renamed and not desired.exists():
                                 if cand_sig is None:
                                     cand_sig = {}
@@ -1010,7 +1017,6 @@ def sync_nested_top_rated(
                                     cand_sig.pop(sg, None)
                                     frenamed += 1
                                     renamed = True
-                            # 3) copy
                             if not renamed:
                                 temp_path = work_dir / f"e{canon.name[:40]}"
                                 try:
@@ -1049,16 +1055,25 @@ def sync_nested_top_rated(
                         sys.exit(f"\n[FATAL] Failed to delete {p.name}: {exc}")
                     fremoved += 1
             if not any(fdir.iterdir()):
-                fdir.rmdir()  # tidy empty folders (e.g. playlist emptied/removed)
+                fdir.rmdir()
 
-        # Record the current duplicate locations for exact renames next run.
+        # Record the full path set per track (folders); root tracks keep their single.
         for src_str, entry in manifest.items():
-            entry["extra_paths"] = sorted(new_extras.get(src_str, []))
+            if src_str in new_paths:
+                entry["paths"] = sorted(new_paths[src_str])
         os.sync()
         print(
             f"Folder copies: {fcopied} copied, {frenamed} renamed, "
             f"{fremoved} removed, {fkept} kept."
         )
+
+    # ---- Remove copies that are no longer wanted (e.g. a track left a playlist or
+    # a root copy superseded by a folder copy during migration).
+    for src_str, entry in manifest.items():
+        keep = set(entry.get("paths") or [])
+        for rel in prev_paths_map.get(src_str, []):
+            if rel not in keep:
+                (dir_root / rel).unlink(missing_ok=True)
 
     clean_junk_files(dir_root)
     shutil.rmtree(work_dir, ignore_errors=True)
@@ -1110,11 +1125,6 @@ def main() -> int:
         "--master-playlist",
         default=DEFAULT_MASTER_PLAYLIST,
         help="master full library playlist name",
-    )
-    ap.add_argument(
-        "--top-rated-playlist",
-        default=DEFAULT_TOP_RATED_PLAYLIST,
-        help="favorites playlist name",
     )
     ap.add_argument(
         "--exclude-playlist",
@@ -1181,18 +1191,12 @@ def main() -> int:
 
     master_set = {str(t.resolve()) for t in master_tracks}
 
-    top_rated_set = {
-        p.resolve()
-        for p in parse_fplite(profile, index, args.top_rated_playlist, source_root)
-        if str(p.resolve()) in master_set
-    }
-
-    # Folder playlists: every playlist except master / Top Rated / the exclude
-    # list / the blacklist. Members get duplicate copies on the card.
+    # Every non-master, non-exclude, non-blacklisted playlist is a folder. Each
+    # member gets one copy there; a track in several playlists gets one per folder.
+    # Tracks in no such playlist live at the card root.
     ignored = set(IGNORED_PLAYLISTS) | set(args.ignore_playlist)
     specials = {
         args.master_playlist.lower(),
-        args.top_rated_playlist.lower(),
         args.exclude_playlist.lower(),
     }
     folder_members: dict[str, set[str]] = {}
@@ -1213,7 +1217,6 @@ def main() -> int:
     sync_nested_top_rated(
         dest_root,
         master_tracks,
-        top_rated_set,
         folder_members,
         args.dry_run,
         force_strip=args.force_strip,

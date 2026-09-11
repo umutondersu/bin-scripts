@@ -68,16 +68,16 @@ The Echo Nano firmware lacks native `.m3u` playlist support and has an 8,192-fil
 
 **Architecture & How It Works:**
 
-* **Favorites Direct Access (`Storage > TF Card > Top Rated`):** Favorite tracks are placed into `/Top Rated/` at the card root for 1-click folder browsing.
-* **Full Library Order (File Browser at card root):** Non-favorite tracks live at the card root, named `0001.`, `0002.`, … in foobar2000 playlist order. A `fatsort -n` pass reorders the FAT directory entries so the Nano's File Browser (which sorts by copy order) shows them in the correct sequence.
-* **Zero Duplicate Files:** Tracks exist as single physical files on disk to stay safely below the 8,192-file firmware indexing limit.
+* **Playlist folders (`Storage > TF Card > <Playlist>`):** Every foobar playlist (`Top Rated`, `Relax`, …) becomes a folder at the card root containing one copy of each member for 1-click folder browsing.
+* **Root / full library:** Tracks in no playlist live at the card root, named `0001.`, `0002.`, … in foobar2000 playlist order. The whole library is visible via the recursive `Category > All Songs` view. A `fatsort -n` pass reorders the FAT directory entries so the Nano's File Browser (which sorts by copy order) shows them in the correct sequence.
+* **No Gratuitous Duplication:** A track is stored once per playlist it belongs to — only tracks in *multiple* playlists are duplicated — keeping the card safely below the 8,192-file firmware indexing limit.
 * **Embedded Cover Art Stripping:** Automatically removes embedded images across FLAC, MP3, WAV, OGG, OPUS, and M4A to save flash storage (can be disabled with `--keep-cover-art`).
 * **Atomic, Crash-Safe Writes:** Every file is staged in a hidden `.sync_tmp` directory, fsynced, then atomically renamed into place — a real filename never holds a torn/partial write, so unplugging mid-sync can't corrupt existing tracks.
-* **Idempotent & Resumable:** State is recorded in an on-card `.manifest_nested.json` (per-track `rel_path`, `rank`, `title`, `mtime`, and on-card `size`). Re-running reconciles against actual on-disk state, validates sizes, and resumes where an interrupted run left off. `Ctrl+C` finishes the current file, saves progress, and exits cleanly; just run it again to continue.
+* **Idempotent & Resumable:** State is recorded in an on-card `.manifest_nested.json` (per-track `paths`, `rank`, `title`, `mtime`, on-card `size`, and cover-art state). Re-running reconciles against actual on-disk state, validates sizes, and resumes where an interrupted run left off. `Ctrl+C` finishes the current file, saves progress, and exits cleanly; just run it again to continue.
 * **Safety & Reliability:** Pre-flight disk space checks, automatic FAT32/exFAT junk cleanup (`.DS_Store`, `._*`, `.Spotlight-V100`, `.fseventsd`, …), `os.sync()` barriers between phases and after `fatsort`, a `fsck.fat` repair before sorting, and the card is left safely unmounted on completion.
 * **Notifications:** Desktop notifications on sync start and completion.
 * **Excluded tracks:** Anything in the foobar `Nano Excluded` playlist stays on the PC but is never synced to the card — a clean way to keep the card under the 8,192-file ceiling without touching your file hierarchy.
-* **Folder playlists:** Every other foobar playlist (e.g. `Relax`) automatically becomes a folder at the card root holding a **duplicate** copy of each member — so the same song can live in `/Top Rated/` *and* `/Relax/`. Scratch playlists are ignored via an internal blacklist, or any playlist can be skipped with `--ignore-playlist`. (Top Rated stays special: single copy, no duplication.) Duplicates are *renamed* rather than re-copied when tracks are renumbered, so reordering stays cheap.
+* **Uniform playlists:** Every non-master foobar playlist is treated identically — its members get a copy in `/<Playlist>/`, and a track in several playlists gets a copy in each (overlaps duplicate). Scratch playlists are ignored via an internal blacklist, or skipped with `--ignore-playlist`. Copies are *renamed* rather than re-copied when tracks are renumbered, so reordering stays cheap.
 
 **Automatic sync on plug-in:** A background watcher (`echo-nano-sync-watch`, documented below) runs the sync automatically whenever the player is plugged in.
 
